@@ -33,9 +33,11 @@
 namespace dlssg_probe {
 
 inline void Log(const std::string& msg) {
+  control_diag::Mark(msg.c_str());
   reshade::log::message(reshade::log::level::info, ("dlssg-probe: " + msg).c_str());
 }
 inline void LogWarn(const std::string& msg) {
+  control_diag::Mark(msg.c_str());
   reshade::log::message(reshade::log::level::warning, ("dlssg-probe: " + msg).c_str());
 }
 
@@ -43,8 +45,9 @@ inline void LogWarn(const std::string& msg) {
 // slSetTagForFrame also appends our buffers.
 inline PFun_slSetTag* real_sl_set_tag = nullptr;
 inline PFun_slSetTagForFrame* real_sl_set_tag_for_frame = nullptr;
-inline bool resolved = false;
-inline bool unavailable = false;
+inline std::atomic<bool> resolved = false;
+inline std::atomic<bool> unavailable = false;
+inline std::atomic<bool> active = false;
 
 inline const char* BufferTypeName(sl::BufferType type) {
   switch (type) {
@@ -102,6 +105,7 @@ inline void Publish(PublishedBuffer& buffer, void* native, uint32_t width, uint3
 
 // One line the first time each buffer type is seen, then silence.
 inline void NoteTags(const sl::ResourceTag* tags, uint32_t count, const char* via) {
+#if defined(CONTROL_RR_DEV) || defined(CONTROL_RR_DIAGNOSTICS)
   if (tags == nullptr) return;
   static std::atomic<uint64_t> seen_mask = 0;
   for (uint32_t i = 0; i < count; ++i) {
@@ -114,6 +118,7 @@ inline void NoteTags(const sl::ResourceTag* tags, uint32_t count, const char* vi
       << " - resource " << (tags[i].resource != nullptr ? tags[i].resource->native : nullptr);
     Log(s.str());
   }
+#endif
 }
 
 inline sl::Result HookedSetTag(const sl::ViewportHandle& viewport, sl::ResourceTag* tags,
@@ -125,7 +130,13 @@ inline sl::Result HookedSetTag(const sl::ViewportHandle& viewport, sl::ResourceT
 inline sl::Result HookedSetTagForFrame(const sl::FrameToken& frame, const sl::ViewportHandle& viewport,
                                        const sl::ResourceTag* tags, uint32_t num_tags,
                                        sl::CommandBuffer* cmd) {
+  control_diag::Scope trace("fg.tags");
+  control_diag::Mark("fg.tags.frame", static_cast<uint32_t>(frame), num_tags);
   NoteTags(tags, num_tags, "slSetTagForFrame");
+
+  if (!active.load()) {
+    return real_sl_set_tag_for_frame(frame, viewport, tags, num_tags, cmd);
+  }
 
   auto* hudless_native = hudless_buffer.native.load(std::memory_order_acquire);
   auto* ui_native = ui_buffer.native.load(std::memory_order_acquire);
@@ -163,6 +174,7 @@ inline sl::Result HookedSetTagForFrame(const sl::FrameToken& frame, const sl::Vi
 
   const auto result = real_sl_set_tag_for_frame(frame, viewport, extended.data(),
                                                 static_cast<uint32_t>(extended.size()), cmd);
+  control_diag::Mark("fg.tags.result", static_cast<uint32_t>(result));
 
   // Loud once, then only when something changes or goes wrong. The staleness
   // figures matter: if the compositor for this frame has not run by the time
@@ -196,31 +208,46 @@ inline sl::Result HookedSetTagForFrame(const sl::FrameToken& frame, const sl::Vi
 // module name); loads and pins nothing. Both tag entry points are core
 // interposer exports.
 inline bool Resolve() {
-  if (resolved) return true;
-  if (unavailable) return false;
+  if (resolved.load()) return true;
+  if (unavailable.load()) return false;
   HMODULE interposer = GetModuleHandleW(L"sl.interposer.dll");
   if (interposer == nullptr) return false;  // no Streamline in the process yet
+
+  const std::lock_guard install_lock(control_rr::detour_mutex);
+  if (resolved.load()) return true;
+  if (unavailable.load()) return false;
 
   auto* set_tag = reinterpret_cast<PFun_slSetTag*>(GetProcAddress(interposer, "slSetTag"));
   auto* set_tag_frame =
       reinterpret_cast<PFun_slSetTagForFrame*>(GetProcAddress(interposer, "slSetTagForFrame"));
   if (set_tag == nullptr || set_tag_frame == nullptr) {
     LogWarn("sl.interposer.dll has no tag entry points - hud-less and UI will not be supplied");
-    unavailable = true;
+    unavailable.store(true);
     return false;
   }
   real_sl_set_tag = set_tag;
   real_sl_set_tag_for_frame = set_tag_frame;
-  DetourTransactionBegin();
-  DetourUpdateThread(GetCurrentThread());
-  DetourAttach(reinterpret_cast<void**>(&real_sl_set_tag), HookedSetTag);
-  DetourAttach(reinterpret_cast<void**>(&real_sl_set_tag_for_frame), HookedSetTagForFrame);
-  if (DetourTransactionCommit() != NO_ERROR) {
+  LONG error = DetourTransactionBegin();
+  const bool transaction_started = error == NO_ERROR;
+  if (error == NO_ERROR) error = DetourUpdateThread(GetCurrentThread());
+  if (error == NO_ERROR) {
+    error = DetourAttach(reinterpret_cast<void**>(&real_sl_set_tag), HookedSetTag);
+  }
+  if (error == NO_ERROR) {
+    error = DetourAttach(reinterpret_cast<void**>(&real_sl_set_tag_for_frame), HookedSetTagForFrame);
+  }
+  if (error != NO_ERROR) {
+    if (transaction_started) DetourTransactionAbort();
+  } else {
+    error = DetourTransactionCommit();
+  }
+  if (error != NO_ERROR) {
     LogWarn("could not detour the tag functions");
-    unavailable = true;
+    real_sl_set_tag = nullptr;
+    real_sl_set_tag_for_frame = nullptr;
     return false;
   }
-  resolved = true;
+  resolved.store(true);
   Log("watching slSetTag / slSetTagForFrame - hud-less and UI will be appended");
   return true;
 }

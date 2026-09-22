@@ -10,9 +10,11 @@
 #include <embed/shaders.h>
 
 #include <d3d12.h>
+#include <wrl/client.h>
 
 #include <deps/imgui/imgui.h>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <mutex>
 #include <shared_mutex>
@@ -30,6 +32,14 @@
 #include "../../utils/platform.hpp"
 #include "../../utils/settings.hpp"
 
+#if !defined(NDEBUG) && !defined(CONTROL_RR_DEV)
+#define CONTROL_RR_DEV 1
+#endif
+
+namespace control_rr {
+inline std::mutex detour_mutex;
+}
+
 // Control: DLSS Ray Reconstruction + frame-generation support.
 //
 // Denoiser bypass (the replaced DLF shaders below) plus DLSS Ray
@@ -40,6 +50,7 @@
 // t1 GBuffer2, t7 hit info) via the descriptor-heap mirror, and
 // at the LSAO resolve (t3 material table, t5 EnvBRDF).
 //
+#include "./diagnostics.hpp"
 #include "./dlssg_probe.hpp"
 #include "./sl_hdr10.hpp"
 #include "./rr.hpp"
@@ -58,14 +69,8 @@ float rr_responsivity_setting = 0.f;  // constant DLSSD.ResponsivityMask; 0 = no
 
 // Specular motion vectors use the reflection pass's per-ray hit arrays and
 // are supplied through GBuffer.SpecularMvec. Enabled by default, with no UI toggle.
-float spec_mv_setting = 1.f;  // 0 = Off, 1 = spec MVs. hitT path retired.
-
 bool RawRtEnabled() { return denoiser_setting >= 1.f; }
 bool RrEnabled() { return denoiser_setting >= 2.f; }
-
-// Map the setting to rr::spec_motion_mode. Nonzero values select our specular
-// motion vectors (mode 2); the unstable hit-distance path (mode 1) stays disabled.
-int SpecModeFromSetting(float value) { return (static_cast<int>(value) <= 0) ? 0 : 2; }
 
 // dropdown index -> NGX preset hint value
 constexpr unsigned int RR_PRESET_VALUES[] = {4u, 5u, 6u};        // D, E, F (RR2, needs driver >= 580)
@@ -92,6 +97,8 @@ renodx::mods::shader::CustomShaders custom_shaders = {
 };
 
 std::atomic<reshade::api::device*> current_device = nullptr;
+void DrainRetiredSnapshots(reshade::api::command_queue* queue);
+void ClearSnapshotState();
 
 // Odd render width or height makes Control's own mip-generation shader drift:
 // it samples the parent at (x + 0.5) / destWidth, which only lands on the
@@ -110,6 +117,7 @@ renodx::utils::settings::Setting* odd_resolution_advice = nullptr;
 // NGX result codes we can explain to a user. 0xBAD00004 is FeatureNotFound,
 // which in practice means nvngx_dlssd.dll is not where NGX looks for it.
 renodx::utils::settings::Setting* rr_failed_warning = nullptr;
+renodx::utils::settings::Setting* sr_failed_warning = nullptr;
 
 // Read once at attach: the swap chain is built the new way or not at all.
 // Off by default - HDR only, and an SDR user with frame generation already
@@ -133,6 +141,18 @@ void UpdateRrFailureLabel() {
       << "). Using Super Resolution for now.";
   }
   rr_failed_warning->label = s.str();
+}
+
+void UpdateSrFailureLabel() {
+  if (sr_failed_warning == nullptr || !rr::sr_failed.load()) return;
+  static unsigned int labelled = 0xFFFFFFFFu;
+  const unsigned int error = rr::sr_last_error.load();
+  if (labelled == error) return;
+  labelled = error;
+  std::stringstream s;
+  s << "SR preset override failed (0x" << std::hex << error << std::dec
+    << "). The game's default SR is active. Select Default, then select the preset again to retry.";
+  sr_failed_warning->label = s.str();
 }
 
 bool OddRenderSize() {
@@ -272,12 +292,15 @@ void OnInitDeviceApply(reshade::api::device* device) {
   rr::TryArmFromLoadedModules();
   // Retry installation during device initialization if Streamline is loaded.
   // The startup watcher also handles loading before or between device events.
-  sl_hdr10::TryInstall();
+  if (sl_hdr10::enabled.load()) sl_hdr10::TryInstall();
 }
 
 void OnDestroyDeviceApply(reshade::api::device* device) {
+  control_diag::Scope trace("device.destroy");
+  control_diag::Mark("device.destroy.pointer", reinterpret_cast<uint64_t>(device));
   reshade::api::device* expected = device;
   current_device.compare_exchange_strong(expected, nullptr);
+  ClearSnapshotState();
 }
 
 // At init_device the saved setting has not been read from the ini yet, so the
@@ -291,24 +314,21 @@ void OnPresentApplyOnce(
     uint32_t, const reshade::api::rect*) {
   if (!boot_state_applied.exchange(true)) {
     ApplyToggle();
-    rr::rr_enabled = RrEnabled();
-    rr::rr_preset = RR_PRESET_VALUES[static_cast<int>(rr_preset_setting)];
-    rr::sr_preset = SR_PRESET_VALUES[static_cast<int>(sr_preset_setting)];
+    rr::SetRrEnabled(RrEnabled());
+    rr::SetRrPreset(RR_PRESET_VALUES[static_cast<int>(rr_preset_setting)]);
+    rr::SetSrPreset(SR_PRESET_VALUES[static_cast<int>(sr_preset_setting)]);
     rr::responsivity_value = rr_responsivity_setting;
-    rr::spec_motion_mode = SpecModeFromSetting(spec_mv_setting);
-    // One line that says which per-frame capture paths have a consumer, so a
-    // log from a user with RR off and no FG shows plainly that the copies
-    // and the descriptor mirror are running for nobody.
     std::stringstream s;
     s << "control-rr: consumers at boot - RR " << (rr::rr_enabled ? "ON" : "off")
-      << ", FG bridge " << (sl_hdr10::enabled.load() ? "ON" : "off")
-      << ", spec-MV mode " << rr::spec_motion_mode.load()
-      << " | capture paths (guides, hudless/UI copies, descriptor mirror) run regardless";
+      << ", FG bridge " << (sl_hdr10::enabled.load() ? "ON" : "off");
     reshade::log::message(reshade::log::level::info, s.str().c_str());
   }
-  dlssg_probe::Poll();
+  rr::ApplyPendingFeatureChanges(queue);
+  DrainRetiredSnapshots(queue);
+  if (sl_hdr10::enabled.load()) dlssg_probe::Poll();
   UpdateOddResolutionLabels();
   UpdateRrFailureLabel();
+  UpdateSrFailureLabel();
   // belt and braces alongside the LoadLibrary hooks
   rr::TryArmFromLoadedModules();
 }
@@ -322,7 +342,9 @@ std::atomic<uint64_t> last_gbuffer1 = 0;
 std::atomic<uint64_t> last_gbuffer2 = 0;
 std::atomic<uint64_t> last_material = 0;
 std::atomic<uint64_t> last_envbrdf = 0;
+#ifdef CONTROL_RR_DEV
 std::atomic<uint64_t> last_hitinfo = 0;
+#endif
 std::atomic<uint64_t> last_matid = 0;
 std::atomic<uint64_t> last_hitpos = 0;
 
@@ -346,6 +368,55 @@ HitSnapshot snap_hudless;
 HitSnapshot snap_ui;
 std::atomic<uint64_t> last_hudless_src = 0;
 std::atomic<uint64_t> last_ui_src = 0;
+
+std::mutex retired_snapshot_mutex;
+std::vector<reshade::api::resource> retired_snapshots;
+
+void RetireSnapshot(reshade::api::resource resource) {
+  control_diag::Mark("snapshot.retire", resource.handle);
+  if (resource.handle == 0u) return;
+  const std::lock_guard lock(retired_snapshot_mutex);
+  retired_snapshots.push_back(resource);
+}
+
+void DrainRetiredSnapshots(reshade::api::command_queue* queue) {
+  std::vector<reshade::api::resource> resources;
+  {
+    const std::lock_guard lock(retired_snapshot_mutex);
+    if (retired_snapshots.empty()) return;
+    resources.swap(retired_snapshots);
+  }
+  control_diag::Scope trace("snapshot.drain");
+  control_diag::Mark("snapshot.wait_idle.begin", resources.size(), reinterpret_cast<uint64_t>(queue));
+  queue->wait_idle();
+  control_diag::Mark("snapshot.wait_idle.end");
+  if (auto* device = current_device.load(); device != nullptr) {
+    for (const auto resource : resources) {
+      control_diag::Mark("snapshot.destroy.begin", resource.handle);
+      device->destroy_resource(resource);
+      control_diag::Mark("snapshot.destroy.end", resource.handle);
+    }
+  }
+}
+
+void ClearSnapshotState() {
+  control_diag::Scope trace("snapshot.clear");
+  rr::SetGuide("matid", nullptr);
+  rr::SetGuide("hitpos", nullptr);
+  dlssg_probe::Publish(dlssg_probe::hudless_buffer, nullptr, 0, 0, 0, 0);
+  dlssg_probe::Publish(dlssg_probe::ui_buffer, nullptr, 0, 0, 0, 0);
+  sl_hdr10::bridge.hudless_source.store(nullptr);
+  snap_matid = {};
+  snap_hitpos = {};
+  snap_hudless = {};
+  snap_ui = {};
+  last_matid.store(0);
+  last_hitpos.store(0);
+  last_hudless_src.store(0);
+  last_ui_src.store(0);
+  const std::lock_guard lock(retired_snapshot_mutex);
+  retired_snapshots.clear();
+}
 
 
 // Capture at the DIFFUSE spatial dispatches (t0 = GBuffer1, t1 = GBuffer2 per
@@ -393,6 +464,8 @@ void OnBindDescriptorTables(
     uint32_t first,
     uint32_t count,
     const reshade::api::descriptor_table* tables) {
+  if ((!rr::rr_enabled.load() || rr::rr_failed.load())
+      && (!sl_hdr10::enabled.load() || !dlssg_probe::active.load())) return;
   if ((static_cast<uint32_t>(stages) & static_cast<uint32_t>(reshade::api::shader_stage::compute)) == 0u) return;
 
   RRCommandListData* data;
@@ -438,6 +511,7 @@ void OnPushDescriptors(
     reshade::api::pipeline_layout,
     uint32_t param_index,
     const reshade::api::descriptor_table_update& update) {
+  if (!rr::rr_enabled.load() || rr::rr_failed.load()) return;
   if ((static_cast<uint32_t>(stages) & static_cast<uint32_t>(reshade::api::shader_stage::compute)) == 0u) return;
   if (update.type != reshade::api::descriptor_type::constant_buffer) return;
   if (update.count == 0) return;
@@ -467,6 +541,9 @@ reshade::api::resource ResolveComputeBinding(
     uint32_t reg,
     bool want_uav,
     bool log_details) {
+#if !defined(CONTROL_RR_DEV) && !defined(CONTROL_RR_DIAGNOSTICS)
+  log_details = false;
+#endif
   const auto* layout_data = renodx::utils::pipeline_layout::GetPipelineLayoutData(rr_data->compute_layout);
   if (layout_data == nullptr) {
     if (log_details) {
@@ -549,24 +626,6 @@ reshade::api::resource ResolveComputeBinding(
   return {0};
 }
 
-reshade::api::resource ResolveComputeSrv(
-    reshade::api::device* device,
-    renodx::utils::descriptor::DeviceData* descriptor_data,
-    RRCommandListData* rr_data,
-    uint32_t reg,
-    bool log_details) {
-  return ResolveComputeBinding(device, descriptor_data, rr_data, reg, false, log_details);
-}
-
-reshade::api::resource ResolveComputeUav(
-    reshade::api::device* device,
-    renodx::utils::descriptor::DeviceData* descriptor_data,
-    RRCommandListData* rr_data,
-    uint32_t reg,
-    bool log_details) {
-  return ResolveComputeBinding(device, descriptor_data, rr_data, reg, true, log_details);
-}
-
 // Which layout parameter carries constant-buffer register b<reg>, space 0.
 // Only root/push descriptors are considered: Control binds sys_constants
 // that way, so the descriptor-table walk used for the SRVs cannot reach it.
@@ -609,6 +668,9 @@ int ResolveComputeCbvParam(
 constexpr uint32_t MATRIX_SOURCE_HASH = 0x87EDDD47;  // specular spatial Y
 
 void CaptureCameraMatrices(RRCommandListData* rr_data) {
+  // A matrix is usable only for the dispatch that just refreshed it. Any
+  // failed capture makes this frame use the ordinary game motion vectors.
+  rr::InvalidateCameraMatrices();
   const auto* layout_data =
       renodx::utils::pipeline_layout::GetPipelineLayoutData(rr_data->compute_layout);
   if (layout_data == nullptr) return;
@@ -658,18 +720,17 @@ void CaptureCameraMatrices(RRCommandListData* rr_data) {
   const float aspect = (fabsf(c2v[5]) > 1e-9f) ? (c2v[0] / c2v[5]) : 0.0f;
   const float expect_aspect = (rh != 0) ? (static_cast<float>(rw) / static_cast<float>(rh)) : 0.0f;
   const bool aspect_ok = fabsf(aspect - expect_aspect) < 0.02f;
-  // previous-view-to-view is near identity while the camera moves slowly
-  const bool p2v_ok = fabsf(p2v[0] - 1.0f) < 0.05f && fabsf(p2v[5] - 1.0f) < 0.05f
-                      && fabsf(p2v[10] - 1.0f) < 0.05f && fabsf(p2v[15] - 1.0f) < 1e-4f;
+  // Camera rotation is allowed to be large. Reject only malformed/non-finite
+  // homogeneous transforms; SetCameraMatrices performs the inverse checks.
+  bool p2v_ok = fabsf(p2v[15] - 1.0f) < 1e-4f;
+  for (int i = 0; i < 16; ++i) p2v_ok = p2v_ok && std::isfinite(p2v[i]);
 
   const bool all_ok = shape_ok && aspect_ok && p2v_ok;
 
-  // Publish only what passed. A rejected frame leaves the previous good
-  // matrices in place rather than feeding NGX a broken reprojection — the
-  // spec-MV shader also guards, but nothing should reach it that we already
-  // know is wrong.
+  // Publish only what passed. A rejected frame intentionally remains invalid.
   if (all_ok) rr::SetCameraMatrices(c2v, p2v);
 
+#ifdef CONTROL_RR_DEV
   static std::atomic<uint64_t> seen = 0;
   static std::atomic<uint64_t> good = 0;
   static std::atomic<int> last_state = -1;
@@ -704,6 +765,7 @@ void CaptureCameraMatrices(RRCommandListData* rr_data) {
     for (int i = 0; i < 16; ++i) s << " " << p2v[i];
     reshade::log::message(reshade::log::level::info, s.str().c_str());
   }
+#endif
 
   D3D12_RANGE no_write = {0, 0};
   buffer->Unmap(0, &no_write);
@@ -713,6 +775,9 @@ std::atomic<bool> capture_logged_dlf = false;
 std::atomic<bool> capture_logged_lsao = false;
 std::atomic<bool> capture_logged_refl = false;
 std::atomic<bool> capture_logged_ui = false;
+// Capture callbacks share snapshot state. Keep their existing serialization
+// separate from the descriptor mirror, which the game's other threads update.
+std::mutex capture_mutex;
 
 // Resolve captured resources at matching dispatches. Avoid periodic logging:
 // synchronous log writes can stall the render thread.
@@ -728,6 +793,15 @@ bool OnDispatchCapture(reshade::api::command_list* cmd_list, uint32_t, uint32_t,
   const bool is_refl = (shader_hash == REFL_HASH);
   const bool is_ui = (shader_hash == UI_COMPOSITE_HASH);
   if (!is_dlf && !is_lsao && !is_matrix_src && !is_refl && !is_ui) return false;
+  control_diag::Scope trace("capture.dispatch");
+  control_diag::Mark("capture.shader", shader_hash, reinterpret_cast<uint64_t>(cmd_list));
+
+  const bool rr_capture = rr::rr_enabled.load() && !rr::rr_failed.load();
+  const bool fg_capture = sl_hdr10::enabled.load() && dlssg_probe::active.load();
+  if (((is_dlf || is_lsao || is_matrix_src || is_refl) && !rr_capture)
+      || (is_ui && !fg_capture)) {
+    return false;
+  }
 
   auto* device = cmd_list->get_device();
   auto* descriptor_data = renodx::utils::data::Get<renodx::utils::descriptor::DeviceData>(device);
@@ -736,8 +810,8 @@ bool OnDispatchCapture(reshade::api::command_list* cmd_list, uint32_t, uint32_t,
   auto* rr_data = renodx::utils::data::Get<RRCommandListData>(cmd_list);
   if (rr_data == nullptr) return false;
 
+  const std::unique_lock capture_lock(capture_mutex);
   const std::shared_lock rr_lock(rr_data->mutex);
-  const std::unique_lock descriptor_lock(descriptor_data->mutex);
 
   const bool log_this = is_dlf  ? !capture_logged_dlf.exchange(true)
                         : is_refl ? !capture_logged_refl.exchange(true)
@@ -748,8 +822,18 @@ bool OnDispatchCapture(reshade::api::command_list* cmd_list, uint32_t, uint32_t,
                           "control-rr: UI compositor dispatch seen - the HUD is a separate layer here");
   }
 
+  auto resolve = [&](uint32_t reg, bool uav) {
+    const std::unique_lock descriptor_lock(descriptor_data->mutex);
+    const auto resource = ResolveComputeBinding(device, descriptor_data, rr_data, reg, uav, log_this);
+    // Retain the native resource before dropping the mirror lock. The game
+    // owns the bound dispatch resources; this reference also keeps each one
+    // alive throughout our CPU-side capture work outside that lock.
+    return Microsoft::WRL::ComPtr<ID3D12Resource>(reinterpret_cast<ID3D12Resource*>(resource.handle));
+  };
+
   auto capture = [&](const char* name, uint32_t reg, std::atomic<uint64_t>& last, bool expect_render_res) {
-    auto resource = ResolveComputeSrv(device, descriptor_data, rr_data, reg, log_this);
+    const auto retained = resolve(reg, false);
+    const reshade::api::resource resource = {reinterpret_cast<uint64_t>(retained.Get())};
     if (resource.handle == 0u) {
       if (log_this) {
         std::stringstream s;
@@ -796,15 +880,16 @@ bool OnDispatchCapture(reshade::api::command_list* cmd_list, uint32_t, uint32_t,
   if (is_dlf) {
     capture("gbuffer1", 0, last_gbuffer1, true);
     capture("gbuffer2", 1, last_gbuffer2, true);
-    if (rr::spec_motion_mode.load() != 0) {
-      capture("hitinfo", 7, last_hitinfo, true);
-    }
+#ifdef CONTROL_RR_DEV
+    capture("hitinfo", 7, last_hitinfo, true);
+#endif
   } else if (is_lsao) {
     capture("material", 3, last_material, false);
     capture("envbrdf", 5, last_envbrdf, false);
   } else if (is_refl) {
     auto snapshot = [&](const char* name, uint32_t reg, std::atomic<uint64_t>& last, HitSnapshot& snap) {
-      auto resource = ResolveComputeSrv(device, descriptor_data, rr_data, reg, log_this);
+      const auto retained = resolve(reg, false);
+      const reshade::api::resource resource = {reinterpret_cast<uint64_t>(retained.Get())};
       if (resource.handle == 0u) return;
       auto desc = device->get_resource_desc(resource);
       const auto previous = last.exchange(resource.handle);
@@ -813,7 +898,8 @@ bool OnDispatchCapture(reshade::api::command_list* cmd_list, uint32_t, uint32_t,
                               && snap.desc.texture.depth_or_layers == desc.texture.depth_or_layers
                               && snap.desc.texture.format == desc.texture.format;
       if (!same_shape) {
-        if (snap.texture.handle != 0u) device->destroy_resource(snap.texture);
+        rr::SetGuide(name, nullptr);
+        RetireSnapshot(snap.texture);
         snap = {};
         reshade::api::resource_desc copy_desc = desc;
         copy_desc.heap = reshade::api::memory_heap::gpu_only;
@@ -863,8 +949,8 @@ bool OnDispatchCapture(reshade::api::command_list* cmd_list, uint32_t, uint32_t,
     auto copy_out = [&](const char* name, uint32_t reg, bool uav, std::atomic<uint64_t>& last,
                         HitSnapshot& snap, dlssg_probe::PublishedBuffer& published,
                         reshade::api::resource_usage src_state) {
-      auto resource = uav ? ResolveComputeUav(device, descriptor_data, rr_data, reg, log_this)
-                          : ResolveComputeSrv(device, descriptor_data, rr_data, reg, log_this);
+      const auto retained = resolve(reg, uav);
+      const reshade::api::resource resource = {reinterpret_cast<uint64_t>(retained.Get())};
       if (resource.handle == 0u) {
         // Control is heavily bindless, so a failed resolve is a real
         // possibility and must not pass quietly.
@@ -886,7 +972,10 @@ bool OnDispatchCapture(reshade::api::command_list* cmd_list, uint32_t, uint32_t,
         // presenting thread and would otherwise read a pointer we just freed;
         // a resolution change is exactly when this happens.
         dlssg_probe::Publish(published, nullptr, 0, 0, 0, 0);
-        if (snap.texture.handle != 0u) device->destroy_resource(snap.texture);
+        if (&published == &dlssg_probe::hudless_buffer) {
+          sl_hdr10::bridge.hudless_source.store(nullptr);
+        }
+        RetireSnapshot(snap.texture);
         snap = {};
         reshade::api::resource_desc copy_desc = desc;
         copy_desc.heap = reshade::api::memory_heap::gpu_only;
@@ -979,7 +1068,7 @@ bool OnDispatchIndirectCapture(
 void OnInitCommandList(reshade::api::command_list* cmd_list) {
   // Retry installation as command lists are created. The startup watcher
   // handles earlier loads; this returns immediately once the hook is installed.
-  sl_hdr10::TryInstall();
+  if (sl_hdr10::enabled.load()) sl_hdr10::TryInstall();
   RRCommandListData* data;
   renodx::utils::data::CreateOrGet(cmd_list, data);
 }
@@ -1007,7 +1096,9 @@ void OnDestroyResource(reshade::api::device*, reshade::api::resource resource) {
   forget(last_gbuffer2, "gbuffer2");
   forget(last_material, "material");
   forget(last_envbrdf, "envbrdf");
+#ifdef CONTROL_RR_DEV
   forget(last_hitinfo, "hitinfo");
+#endif
   // matid/hitpos guides point at OUR snapshots, not the game's arrays — nothing to forget
   uint64_t expected = resource.handle;
   last_matid.compare_exchange_strong(expected, 0u);
@@ -1039,6 +1130,13 @@ renodx::utils::settings::Settings settings = {
         .tint = 0xFF0000,
         .is_visible = []() { return rr::rr_failed.load(); },
     },
+    sr_failed_warning = new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::TEXT,
+        .label = "SR preset override failed.",
+        .section = "Ray Tracing",
+        .tint = 0xFF0000,
+        .is_visible = []() { return rr::sr_failed.load(); },
+    },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::TEXT,
         .label = "Preset F needs a newer driver, so preset E is being used instead.",
@@ -1060,7 +1158,7 @@ renodx::utils::settings::Settings settings = {
         .labels = {"Game", "DLSS Super Resolution", "DLSS Ray Reconstruction"},
         .on_change_value = [](float, float) {
           ApplyToggle();
-          rr::rr_enabled = RrEnabled();
+          rr::SetRrEnabled(RrEnabled());
         },
     },
     new renodx::utils::settings::Setting{
@@ -1072,7 +1170,7 @@ renodx::utils::settings::Settings settings = {
         .section = "Ray Tracing",
         .labels = {"D", "E", "F"},
         .on_change_value = [](float, float value) {
-          rr::rr_preset = RR_PRESET_VALUES[static_cast<int>(value)];
+          rr::SetRrPreset(RR_PRESET_VALUES[static_cast<int>(value)]);
         },
     },
     new renodx::utils::settings::Setting{
@@ -1084,7 +1182,7 @@ renodx::utils::settings::Settings settings = {
         .section = "Ray Tracing",
         .labels = {"Default", "J", "K", "L", "M"},
         .on_change_value = [](float, float value) {
-          rr::sr_preset = SR_PRESET_VALUES[static_cast<int>(value)];
+          rr::SetSrPreset(SR_PRESET_VALUES[static_cast<int>(value)]);
         },
     },
     new renodx::utils::settings::Setting{
@@ -1237,6 +1335,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     case DLL_PROCESS_ATTACH:
       if (!reshade::register_addon(h_module)) return FALSE;
       PinModule();
+      control_diag::Init(h_module);
 
       // Runtime (bind-time) shadow-PSO replacement only — no cbuffer
       // injection, no root-signature or layout modification of any kind.
@@ -1248,13 +1347,13 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
       // Enables the descriptor-heap mirror that OnDispatchCapture resolves
       // GBuffer1 through.
+      // Descriptor contents must be mirrored from heap creation onward so a
+      // live RR/FG toggle can resolve tables that were populated earlier.
+      // The expensive per-frame copies remain consumer-gated below.
       renodx::utils::descriptor::trace_descriptor_tables = true;
 
       // In-process RR: watch for the NGX runtime and detour its D3D12
       // exports (CreateFeature/EvaluateFeature). See rr.hpp.
-      // Start watching before device events so Streamline's factory can be
-      // hooked as soon as the interposer loads.
-      sl_hdr10::WatchForStreamline();
       rr::InstallLoaderHooks();
 
       reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchainLog);
@@ -1274,6 +1373,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
       break;
     case DLL_PROCESS_DETACH:
+      control_diag::Mark("process.detach", reinterpret_cast<uint64_t>(lpv_reserved));
       rr::UninstallHooks();
       reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchainLog);
       reshade::unregister_event<reshade::addon_event::init_device>(OnInitDeviceApply);
@@ -1295,12 +1395,13 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   renodx::utils::settings::use_presets = false;  // no vanilla/1/2/3 presets for this mod
   renodx::utils::settings::Use(fdw_reason, &settings, &OnPresetOff);
 
-  // Read after settings::Use so the saved value is available. The bridge
-  // (sl_hdr10.hpp) changes what frame generation is built from, which is the
-  // one thing that decides whether it runs at all; it only ever acts on a
-  // Streamline instance somebody else loaded.
-  fg_sl_hdr10_boot_value = fg_sl_hdr10_setting;
-  sl_hdr10::enabled = (fg_sl_hdr10_setting != 0.f);
+  if (fdw_reason == DLL_PROCESS_ATTACH) {
+    // Read only on process attach, after settings::Use loaded the saved value.
+    // Thread attach/detach must not mutate session boot state.
+    fg_sl_hdr10_boot_value = fg_sl_hdr10_setting;
+    sl_hdr10::enabled = (fg_sl_hdr10_setting != 0.f);
+    if (sl_hdr10::enabled.load()) sl_hdr10::WatchForStreamline();
+  }
 
   renodx::mods::shader::Use(fdw_reason, custom_shaders);
   renodx::utils::descriptor::Use(fdw_reason);

@@ -47,13 +47,12 @@ void main(uint3 id: SV_DispatchThreadID) {
   float3 c_blur = source.SampleLevel(linear_mip_clamp, uv, 1.2);
   float lum_b = dot(c_blur, kLum);
   float lum_c = dot(c, kLum);
-  float inv_lum = (lum_c != 0.0) ? 1.0 / lum_c : 0.0;
-  float3 c_clamped = min(lum_b, lum_c) * (c * inv_lum);
 
   // FIREFLY_CLAMP is a log-domain strength: 0 = off (raw), 1 = vanilla hard
   // cap; 0.5 removes half the excess *stops*. Linear lerp is useless here --
   // outliers are orders of magnitude, so perceptual blending must be
   // geometric: out = lum * (cap/lum)^s.
+  float3 c_clamped;
   {
     float cap = min(lum_b, lum_c);
     float ratio = (lum_c > 0.0) ? min(cap / lum_c, 1.0) : 1.0;

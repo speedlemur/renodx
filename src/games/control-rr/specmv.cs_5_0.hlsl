@@ -57,9 +57,11 @@ Texture2D<float2> GameMV : register(t3);        // game motion vectors
 Texture2DArray<float4> HitPos : register(t4);   // g_tPosition_TexcoordY, .xyz view-space hit
 
 RWTexture2D<float2> SpecMV : register(u0);
+#ifndef NDEBUG
 // Evidence texture for the diagnostic dump: (hit_t, effective_t, |correction|
 // in game MV units, applied flag). Written for every pixel.
 RWTexture2D<float4> Debug : register(u1);
+#endif
 
 #define MATID_NO_RAY 0xFFFE   // no more rays for this pixel
 #define MATID_SKY    0xFFFF   // ray escaped: no finite hit, excluded from the min
@@ -135,7 +137,9 @@ void main(uint3 tid : SV_DispatchThreadID)
     if (!(effective_t > 0.0))
     {
         SpecMV[tid.xy] = game_mv;
+#ifndef NDEBUG
         Debug[tid.xy] = float4(hit_t, effective_t, 0.0, 0.0);
+#endif
         return;
     }
 
@@ -147,11 +151,15 @@ void main(uint3 tid : SV_DispatchThreadID)
     if (!all(abs(correction) < NDC_CORRECTION_MAX))
     {
         SpecMV[tid.xy] = game_mv;
+#ifndef NDEBUG
         Debug[tid.xy] = float4(hit_t, effective_t, 0.0, -1.0);  // rejected
+#endif
         return;
     }
 
     float2 scaled = correction * float2(MvOutScaleX, MvOutScaleY);
     SpecMV[tid.xy] = game_mv + scaled;
+#ifndef NDEBUG
     Debug[tid.xy] = float4(hit_t, effective_t, length(scaled), 1.0);
+#endif
 }

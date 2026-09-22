@@ -52,9 +52,11 @@
 namespace sl_hdr10 {
 
 inline void Log(const std::string& msg) {
+  control_diag::Mark(msg.c_str());
   reshade::log::message(reshade::log::level::info, ("sl-hdr10: " + msg).c_str());
 }
 inline void LogWarn(const std::string& msg) {
+  control_diag::Mark(msg.c_str());
   reshade::log::message(reshade::log::level::warning, ("sl-hdr10: " + msg).c_str());
 }
 
@@ -257,6 +259,8 @@ struct Bridge {
   UINT height = 0;
   bool ready = false;
   bool failed = false;
+  bool format_rewritten = false;
+  void* rewritten_swap_chain = nullptr;
 };
 
 inline Bridge bridge;
@@ -264,7 +268,50 @@ inline Bridge bridge;
 // Everything the bridge owns, dropped. Called before a resize destroys the
 // buffers underneath us, and it deliberately clears `failed` too so the next
 // present rebuilds rather than staying broken for the rest of the session.
-inline void ReleaseBridge() {
+inline bool WaitForFence(UINT64 value, DWORD timeout_ms, const char* operation) {
+  control_diag::Scope trace("bridge.wait_fence");
+#if defined(CONTROL_RR_DEV) || defined(CONTROL_RR_DIAGNOSTICS)
+  control_diag::Mark("bridge.fence.target_completed", value, bridge.fence != nullptr ? bridge.fence->GetCompletedValue() : 0);
+#endif
+  if (value == 0 || bridge.fence == nullptr || bridge.fence->GetCompletedValue() >= value) {
+    return true;
+  }
+  if (bridge.fence_event == nullptr) {
+    bridge.fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  }
+  if (bridge.fence_event == nullptr) {
+    LogWarn(std::string(operation) + ": could not create fence event");
+    return false;
+  }
+  if (FAILED(bridge.fence->SetEventOnCompletion(value, bridge.fence_event))) {
+    LogWarn(std::string(operation) + ": SetEventOnCompletion failed");
+    return false;
+  }
+  const DWORD wait = WaitForSingleObject(bridge.fence_event, timeout_ms);
+  if (wait != WAIT_OBJECT_0) {
+    std::stringstream s;
+    s << operation << ": GPU fence wait failed (result 0x" << std::hex << wait << ")";
+    LogWarn(s.str());
+    return false;
+  }
+  return true;
+}
+
+inline bool WaitForBridgeIdle() {
+  if (bridge.queue == nullptr || bridge.fence == nullptr) return true;
+  const UINT64 value = ++bridge.fence_value;
+  if (FAILED(bridge.queue->Signal(bridge.fence, value))) {
+    LogWarn("bridge release: queue Signal failed");
+    return false;
+  }
+  return WaitForFence(value, 2000, "bridge release");
+}
+
+inline bool ReleaseBridge() {
+  control_diag::Scope trace("bridge.release");
+  if (!WaitForBridgeIdle()) return false;
+  dlssg_probe::Publish(dlssg_probe::hudless_buffer, nullptr, 0, 0, 0, 0);
+  bridge.hudless_source.store(nullptr);
   for (auto*& r : bridge.surrogate) { if (r != nullptr) { r->Release(); r = nullptr; } }
   for (auto*& r : bridge.back_buffer) { if (r != nullptr) { r->Release(); r = nullptr; } }
   for (auto*& a : bridge.allocator) { if (a != nullptr) { a->Release(); a = nullptr; } }
@@ -285,6 +332,9 @@ inline void ReleaseBridge() {
   bridge.buffer_count = 0;
   bridge.ready = false;
   bridge.failed = false;
+  bridge.format_rewritten = false;
+  bridge.rewritten_swap_chain = nullptr;
+  return true;
 }
 
 inline bool BuildPipeline() {
@@ -368,8 +418,8 @@ inline bool BuildPipeline() {
 }
 
 inline bool EnsureBridge(IDXGISwapChain* swap_chain) {
-  if (bridge.ready) return true;
   if (bridge.failed) return false;
+  if (bridge.ready) return true;
   if (bridge.queue == nullptr) return false;  // captured when the chain was created
 
   IDXGISwapChain3* chain3 = nullptr;
@@ -622,6 +672,7 @@ inline void EncodeHudless() {
 // Draw the surrogate into the real back buffer, on the queue that presents, so
 // it has landed before frame generation looks at the frame.
 inline void EncodeSurrogate() {
+  control_diag::Scope trace("bridge.encode");
   // One index for both ends. Streamline's proxy hands the game a game-facing
   // index, and this is the buffer it is about to read as "the game's frame".
   // Measured: Control never calls GetCurrentBackBufferIndex - it alternates
@@ -641,23 +692,8 @@ inline void EncodeSurrogate() {
     return;
   }
 
-  // Wait for the GPU to finish using this allocator before resetting it.
-  if (bridge.pending[index] != 0 && bridge.fence->GetCompletedValue() < bridge.pending[index]) {
-    if (bridge.fence_event == nullptr) {
-      bridge.fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    }
-    if (bridge.fence_event != nullptr
-        && SUCCEEDED(bridge.fence->SetEventOnCompletion(bridge.pending[index],
-                                                        bridge.fence_event))) {
-      if (WaitForSingleObject(bridge.fence_event, 1000) == WAIT_TIMEOUT) {
-        // Log the timeout before the allocator reset below, which still proceeds.
-        static std::atomic<int> logged = 0;
-        if (logged.fetch_add(1) < 3) {
-          LogWarn("GPU did not finish the previous encode within 1s - allocator reset under a live fence");
-        }
-      }
-    }
-  }
+  // Never reset allocator memory while the GPU can still be reading it.
+  if (!WaitForFence(bridge.pending[index], 1000, "bridge encode")) return;
 
   // Ask for the destination fresh. Streamline manages its own buffers behind
   // GetBuffer; measured stable across a run, but a re-query costs nothing and
@@ -679,8 +715,16 @@ inline void EncodeSurrogate() {
     }
   }
 
-  bridge.allocator[index]->Reset();
-  bridge.command_list->Reset(bridge.allocator[index], bridge.pipeline);
+  if (FAILED(bridge.allocator[index]->Reset())) {
+    LogWarn("bridge encode: command allocator Reset failed");
+    bridge.failed = true;
+    return;
+  }
+  if (FAILED(bridge.command_list->Reset(bridge.allocator[index], bridge.pipeline))) {
+    LogWarn("bridge encode: command list Reset failed");
+    bridge.failed = true;
+    return;
+  }
 
   D3D12_RESOURCE_BARRIER open[2] = {};
   open[0].Transition.pResource = bridge.surrogate[index];
@@ -718,16 +762,25 @@ inline void EncodeSurrogate() {
   bridge.command_list->DrawInstanced(3, 1, 0, 0);
   EncodeHudless();
   bridge.command_list->ResourceBarrier(2, shut);
-  bridge.command_list->Close();
+  if (FAILED(bridge.command_list->Close())) {
+    LogWarn("bridge encode: command list Close failed");
+    bridge.failed = true;
+    return;
+  }
 
   ID3D12CommandList* lists[] = {bridge.command_list};
   bridge.queue->ExecuteCommandLists(1, lists);
-  bridge.queue->Signal(bridge.fence, ++bridge.fence_value);
+  if (FAILED(bridge.queue->Signal(bridge.fence, ++bridge.fence_value))) {
+    LogWarn("bridge encode: queue Signal failed");
+    bridge.failed = true;
+    return;
+  }
   bridge.pending[index] = bridge.fence_value;
 }
 
 inline void RunEncode(IDXGISwapChain* swap_chain) {
   if (!enabled.load()) return;
+  if (!bridge.format_rewritten || bridge.rewritten_swap_chain != swap_chain) return;
   if (!EnsureBridge(swap_chain)) {
     // The format was already rewritten at creation, so there is no way back
     // to FP16 here: the game is drawing into a 10-bit surface nobody encodes.
@@ -746,29 +799,59 @@ inline void RunEncode(IDXGISwapChain* swap_chain) {
 inline HRESULT STDMETHODCALLTYPE HookedResizeBuffers(IDXGISwapChain* swap_chain, UINT count,
                                                      UINT width, UINT height, DXGI_FORMAT format,
                                                      UINT flags) {
+  control_diag::Scope trace("bridge.resize");
+  control_diag::Mark("bridge.resize.dimensions", width, height);
   // Everything we hold refers to buffers that are about to stop existing.
-  ReleaseBridge();
-  if (enabled.load() && format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+  const bool rebuild = enabled.load() && bridge.format_rewritten
+                       && bridge.rewritten_swap_chain == swap_chain;
+  if (rebuild && !ReleaseBridge()) return DXGI_ERROR_WAS_STILL_DRAWING;
+  if (rebuild && format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
     format = DXGI_FORMAT_R10G10B10A2_UNORM;
   }
   const HRESULT result = real_resize_buffers(swap_chain, count, width, height, format, flags);
+  control_diag::Mark("bridge.resize.result", static_cast<uint32_t>(result));
   // Rebuild before returning: Control requests its buffers immediately after
   // resizing and needs the FP16 surrogates for its linear output.
-  if (SUCCEEDED(result) && enabled.load()) EnsureBridge(swap_chain);
+  if (rebuild) {
+    bridge.format_rewritten = true;
+    bridge.rewritten_swap_chain = swap_chain;
+    EnsureBridge(swap_chain);
+  }
   return result;
+}
+
+inline void LogPresentFailure(HRESULT result) {
+  if (SUCCEEDED(result)) return;
+  static std::atomic<HRESULT> logged_error = S_OK;
+  if (logged_error.exchange(result) == result) return;
+  std::stringstream message;
+  message << "Present failed HRESULT=0x" << std::hex << static_cast<uint32_t>(result);
+  if (bridge.device != nullptr) {
+    message << " device removal reason=0x"
+            << static_cast<uint32_t>(bridge.device->GetDeviceRemovedReason());
+  }
+  LogWarn(message.str());
 }
 
 inline HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* swap_chain, UINT sync_interval,
                                                UINT flags) {
+  control_diag::Scope trace("bridge.present");
   RunEncode(swap_chain);
-  return real_present(swap_chain, sync_interval, flags);
+  const HRESULT result = real_present(swap_chain, sync_interval, flags);
+  control_diag::Mark("bridge.present.result", static_cast<uint32_t>(result));
+  LogPresentFailure(result);
+  return result;
 }
 
 inline HRESULT STDMETHODCALLTYPE HookedPresent1(IDXGISwapChain1* swap_chain, UINT sync_interval,
                                                 UINT flags,
                                                 const DXGI_PRESENT_PARAMETERS* parameters) {
+  control_diag::Scope trace("bridge.present1");
   RunEncode(swap_chain);
-  return real_present1(swap_chain, sync_interval, flags, parameters);
+  const HRESULT result = real_present1(swap_chain, sync_interval, flags, parameters);
+  control_diag::Mark("bridge.present1.result", static_cast<uint32_t>(result));
+  LogPresentFailure(result);
+  return result;
 }
 
 // Control gets its own floating-point surface; Streamline and NVIDIA keep the
@@ -777,32 +860,42 @@ inline HRESULT STDMETHODCALLTYPE HookedGetBuffer(IDXGISwapChain* swap_chain, UIN
                                                  REFIID riid, void** surface) {
   // Never answer the game without a bridge: the real buffer is 10-bit and
   // the game cannot render into it.
-  if (enabled.load() && !bridge.ready && !bridge.failed) EnsureBridge(swap_chain);
-  if (enabled.load() && bridge.ready && buffer < bridge.buffer_count
+  const bool is_bridge_chain = enabled.load() && bridge.format_rewritten
+                               && bridge.rewritten_swap_chain == swap_chain;
+  if (is_bridge_chain && !bridge.ready && !bridge.failed) EnsureBridge(swap_chain);
+  if (is_bridge_chain && bridge.ready && buffer < bridge.buffer_count
       && bridge.surrogate[buffer] != nullptr && !CallerIsStreamlineOrNvidia(_ReturnAddress())) {
     return bridge.surrogate[buffer]->QueryInterface(riid, surface);
   }
   return real_get_buffer(swap_chain, buffer, riid, surface);
 }
 
-inline void RewriteFormat(DXGI_FORMAT& format) {
-  if (!enabled.load()) return;
-  if (format != DXGI_FORMAT_R16G16B16A16_FLOAT) return;
+inline bool RewriteFormat(DXGI_FORMAT& format) {
+  if (!enabled.load()) return false;
+  if (format != DXGI_FORMAT_R16G16B16A16_FLOAT) return false;
   format = DXGI_FORMAT_R10G10B10A2_UNORM;
   Log("swap chain requested as FP16, created as RGB10A2 for frame generation");
+  return true;
 }
 
 inline HRESULT STDMETHODCALLTYPE HookedCreateSwapChain(IDXGIFactory* factory, IUnknown* device,
                                                        DXGI_SWAP_CHAIN_DESC* desc,
                                                        IDXGISwapChain** swap_chain) {
-  if (desc != nullptr) RewriteFormat(desc->BufferDesc.Format);
-  if (device != nullptr && bridge.queue == nullptr) {
+  bool can_rewrite = enabled.load() && desc != nullptr
+                     && desc->BufferDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+  if (can_rewrite && bridge.queue == nullptr) {
     // For D3D12 this parameter is the command queue that will present, which
     // is exactly the queue our encode has to be recorded on.
-    device->QueryInterface(IID_PPV_ARGS(&bridge.queue));
+    if (device == nullptr || FAILED(device->QueryInterface(IID_PPV_ARGS(&bridge.queue)))) {
+      LogWarn("swap-chain device is not a D3D12 command queue - leaving FP16 unchanged");
+      can_rewrite = false;
+    }
   }
+  const bool rewritten = can_rewrite && RewriteFormat(desc->BufferDesc.Format);
   const auto hr = real_create_swap_chain(factory, device, desc, swap_chain);
-  if (SUCCEEDED(hr) && swap_chain != nullptr && *swap_chain != nullptr) {
+  if (rewritten && SUCCEEDED(hr) && swap_chain != nullptr && *swap_chain != nullptr) {
+    bridge.format_rewritten = true;
+    bridge.rewritten_swap_chain = *swap_chain;
     PatchSwapChainVTable(*swap_chain);
     // Immediately, not at first present: Control asks for its buffers once at
     // start-up and keeps them. A surrogate that arrives later is never taken.
@@ -817,18 +910,26 @@ inline HRESULT STDMETHODCALLTYPE HookedCreateSwapChainForHwnd(
     IDXGISwapChain1** swap_chain) {
   DXGI_SWAP_CHAIN_DESC1 patched = {};
   const DXGI_SWAP_CHAIN_DESC1* use = desc;
+  bool can_rewrite = enabled.load() && desc != nullptr
+                     && desc->Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+  if (can_rewrite && bridge.queue == nullptr) {
+    if (device == nullptr || FAILED(device->QueryInterface(IID_PPV_ARGS(&bridge.queue)))) {
+      LogWarn("swap-chain device is not a D3D12 command queue - leaving FP16 unchanged");
+      can_rewrite = false;
+    }
+  }
   if (desc != nullptr) {
     patched = *desc;
-    RewriteFormat(patched.Format);
+    if (can_rewrite) RewriteFormat(patched.Format);
     use = &patched;
   }
-  if (device != nullptr && bridge.queue == nullptr) {
-    device->QueryInterface(IID_PPV_ARGS(&bridge.queue));
-  }
+  const bool rewritten = desc != nullptr && patched.Format != desc->Format;
   const auto hr =
       real_create_swap_chain_for_hwnd(factory, device, hwnd, use, fullscreen, restrict_output,
                                       swap_chain);
-  if (SUCCEEDED(hr) && swap_chain != nullptr && *swap_chain != nullptr) {
+  if (rewritten && SUCCEEDED(hr) && swap_chain != nullptr && *swap_chain != nullptr) {
+    bridge.format_rewritten = true;
+    bridge.rewritten_swap_chain = *swap_chain;
     PatchSwapChainVTable(*swap_chain);
     EnsureBridge(*swap_chain);
   }
@@ -836,6 +937,9 @@ inline HRESULT STDMETHODCALLTYPE HookedCreateSwapChainForHwnd(
 }
 
 inline void PatchSwapChainVTable(IDXGISwapChain* swap_chain) {
+  if (swapchain_patched.load()) return;
+  static std::mutex patch_mutex;
+  const std::lock_guard patch_lock(patch_mutex);
   if (swapchain_patched.load()) return;
   // Confirm the object really is what the slot numbers assume before writing
   // into its table.
@@ -879,33 +983,36 @@ inline PFN_slUpgradeInterface real_upgrade_interface = nullptr;
 
 inline void PatchFactoryVTable(void* factory) {
   if (factory == nullptr) return;
+  static std::mutex patch_mutex;
+  const std::lock_guard patch_lock(patch_mutex);
   auto** vtable = *reinterpret_cast<void***>(factory);
   static std::atomic<uintptr_t> patched_tables[8] = {};
   for (auto& slot : patched_tables) {
     if (slot.load() == reinterpret_cast<uintptr_t>(vtable)) return;  // already ours
   }
-  for (auto& slot : patched_tables) {
-    uintptr_t expected = 0;
-    if (slot.compare_exchange_strong(expected, reinterpret_cast<uintptr_t>(vtable))) break;
-  }
   void* original = nullptr;
-  bool ok = false;
+  bool hwnd_ok = false;
   if (PatchSlot(vtable, kSlotCreateSwapChainForHwnd,
                 reinterpret_cast<void*>(&HookedCreateSwapChainForHwnd), &original)) {
     if (original != reinterpret_cast<void*>(&HookedCreateSwapChainForHwnd)) {
       real_create_swap_chain_for_hwnd = reinterpret_cast<PFN_CreateSwapChainForHwnd>(original);
     }
-    ok = true;
+    hwnd_ok = true;
   }
   original = nullptr;
+  bool base_ok = false;
   if (PatchSlot(vtable, kSlotCreateSwapChain, reinterpret_cast<void*>(&HookedCreateSwapChain),
                 &original)) {
     if (original != reinterpret_cast<void*>(&HookedCreateSwapChain)) {
       real_create_swap_chain = reinterpret_cast<PFN_CreateSwapChain>(original);
     }
-    ok = true;
+    base_ok = true;
   }
-  if (ok) {
+  if (hwnd_ok && base_ok) {
+    for (auto& slot : patched_tables) {
+      uintptr_t expected = 0;
+      if (slot.compare_exchange_strong(expected, reinterpret_cast<uintptr_t>(vtable))) break;
+    }
     Log("patched Streamline's factory: CreateSwapChain, CreateSwapChainForHwnd");
   } else {
     LogWarn("could not patch Streamline's factory - frame generation will stay idle");
@@ -914,8 +1021,13 @@ inline void PatchFactoryVTable(void* factory) {
 
 inline sl::Result HookedUpgradeInterface(void** base_interface) {
   const auto result = real_upgrade_interface(base_interface);
-  if (result == sl::Result::eOk && base_interface != nullptr) {
-    PatchFactoryVTable(*base_interface);
+  if (result == sl::Result::eOk && base_interface != nullptr && *base_interface != nullptr) {
+    IDXGIFactory2* factory = nullptr;
+    auto* object = static_cast<IUnknown*>(*base_interface);
+    if (SUCCEEDED(object->QueryInterface(IID_PPV_ARGS(&factory))) && factory != nullptr) {
+      PatchFactoryVTable(factory);
+      factory->Release();
+    }
   }
   return result;
 }
@@ -924,9 +1036,12 @@ inline sl::Result HookedUpgradeInterface(void** base_interface) {
 // detour. Idempotent: detouring twice would detour our own hook onto itself,
 // which overflows the stack with nothing in any log.
 inline bool InstallUpgradeWatch() {
-  if (real_upgrade_interface != nullptr) return true;
+  static std::atomic<bool> installed = false;
+  if (installed.load()) return true;
   HMODULE interposer = GetModuleHandleW(L"sl.interposer.dll");
   if (interposer == nullptr) return false;
+  const std::lock_guard install_lock(control_rr::detour_mutex);
+  if (installed.load()) return true;
   auto* upgrade =
       reinterpret_cast<PFN_slUpgradeInterface>(GetProcAddress(interposer, "slUpgradeInterface"));
   if (upgrade == nullptr) {
@@ -934,14 +1049,23 @@ inline bool InstallUpgradeWatch() {
     return false;
   }
   real_upgrade_interface = upgrade;
-  DetourTransactionBegin();
-  DetourUpdateThread(GetCurrentThread());
-  DetourAttach(reinterpret_cast<void**>(&real_upgrade_interface), HookedUpgradeInterface);
-  if (DetourTransactionCommit() != NO_ERROR) {
+  LONG error = DetourTransactionBegin();
+  const bool transaction_started = error == NO_ERROR;
+  if (error == NO_ERROR) error = DetourUpdateThread(GetCurrentThread());
+  if (error == NO_ERROR) {
+    error = DetourAttach(reinterpret_cast<void**>(&real_upgrade_interface), HookedUpgradeInterface);
+  }
+  if (error != NO_ERROR) {
+    if (transaction_started) DetourTransactionAbort();
+  } else {
+    error = DetourTransactionCommit();
+  }
+  if (error != NO_ERROR) {
     LogWarn("could not detour slUpgradeInterface");
     real_upgrade_interface = nullptr;
     return false;
   }
+  installed.store(true);
   Log("watching slUpgradeInterface");
   return true;
 }

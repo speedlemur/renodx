@@ -54,10 +54,12 @@ namespace rr {
 // ---------------------------------------------------------------------------
 
 inline void Log(const std::string& msg) {
+  control_diag::Mark(msg.c_str());
   reshade::log::message(reshade::log::level::info, ("rr: " + msg).c_str());
 }
 
 inline void LogWarn(const std::string& msg) {
+  control_diag::Mark(msg.c_str());
   reshade::log::message(reshade::log::level::warning, ("rr: " + msg).c_str());
 }
 
@@ -90,7 +92,9 @@ inline std::atomic<ID3D12Resource*> guide_gbuffer1 = nullptr;
 inline std::atomic<ID3D12Resource*> guide_gbuffer2 = nullptr;
 inline std::atomic<ID3D12Resource*> guide_material = nullptr;
 inline std::atomic<ID3D12Resource*> guide_envbrdf = nullptr;
+#ifdef CONTROL_RR_DEV
 inline std::atomic<ID3D12Resource*> guide_hitinfo = nullptr;
+#endif
 // reflection pass hit-attribute arrays: t26 / t28 of 0xABEC7E90
 inline std::atomic<ID3D12Resource*> guide_matid = nullptr;
 inline std::atomic<ID3D12Resource*> guide_hitpos = nullptr;
@@ -104,23 +108,18 @@ inline void SetGuide(const char* name, ID3D12Resource* resource) {
     guide_material = resource;
   } else if (strcmp(name, "envbrdf") == 0) {
     guide_envbrdf = resource;
-  } else if (strcmp(name, "hitinfo") == 0) {
+  }
+#ifdef CONTROL_RR_DEV
+  else if (strcmp(name, "hitinfo") == 0) {
     guide_hitinfo = resource;
-  } else if (strcmp(name, "matid") == 0) {
+  }
+#endif
+  else if (strcmp(name, "matid") == 0) {
     guide_matid = resource;
   } else if (strcmp(name, "hitpos") == 0) {
     guide_hitpos = resource;
   }
 }
-
-// specular motion input mode: 0 = off, 1 = hitT + matrices to NGX (RETIRED,
-// see below), 2 = app-computed specular MVs (texture delivery, so a bad
-// frame fails locally rather than scene-wide).
-inline std::atomic<int> spec_motion_mode = 0;
-
-// Disabled after intermittent full-scene flicker with hit-distance and matrix
-// inputs. The cause remains unresolved; use the specular-motion-vector path.
-inline constexpr bool kHitTPathEnabled = false;
 
 // Size of the game's sys_constants block. Offsets within it are NOT
 // guessed — they are the RDEF of 0x9018E4F2 (disassemble the dumped blob
@@ -139,6 +138,8 @@ inline std::atomic<bool> rr_failed = false;
 // outcome only in its own log), so these are the only in-process signals we
 // have that the user is not getting what the UI says.
 inline std::atomic<unsigned int> rr_last_error = 0;
+inline std::atomic<bool> sr_failed = false;
+inline std::atomic<unsigned int> sr_last_error = 0;
 // Our own F -> E retry fired: the driver is older than F requires. The DLL
 // also has a SILENT fallback path for the same condition which succeeds and
 // which we cannot detect.
@@ -166,8 +167,6 @@ inline const char* StatusTextFor(Status s) {
   }
   return "RR: ?";
 }
-
-inline const char* StatusText() { return StatusTextFor(static_cast<Status>(status.load())); }
 
 // every transition logs its reason — the OSD can go stale while the game
 // is paused (status only updates at evaluate), and a silent bail used to
@@ -309,8 +308,6 @@ class RrgPass {
     return true;
   }
 
-  [[nodiscard]] bool IsInitialized() const { return initialized_; }
-
   // typeless -> typed mapping for SRV creation on game resources
   static DXGI_FORMAT TypedFormat(DXGI_FORMAT format) {
     switch (format) {
@@ -448,7 +445,12 @@ class SpecMvPass {
     ranges[0].BaseShaderRegister = 0;
     ranges[0].OffsetInDescriptorsFromTableStart = 0;
     ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    ranges[1].NumDescriptors = 2;
+    ranges[1].NumDescriptors =
+#ifdef CONTROL_RR_DEV
+        2;
+#else
+        1;
+#endif
     ranges[1].BaseShaderRegister = 0;
     ranges[1].OffsetInDescriptorsFromTableStart = 5;
 
@@ -499,8 +501,6 @@ class SpecMvPass {
     return true;
   }
 
-  [[nodiscard]] bool IsInitialized() const { return initialized_; }
-
   void Dispatch(ID3D12GraphicsCommandList* cmd_list,
                 ID3D12Resource* gbuffer1, ID3D12Resource* matid, ID3D12Resource* hitpos,
                 ID3D12Resource* depth, ID3D12Resource* game_mv,
@@ -544,8 +544,12 @@ class SpecMvPass {
     uav.Format = DXGI_FORMAT_R16G16_FLOAT;
     uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     device_->CreateUnorderedAccessView(out_specmv, nullptr, &uav, cpu(5));
+#ifdef CONTROL_RR_DEV
     uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     device_->CreateUnorderedAccessView(out_debug, nullptr, &uav, cpu(6));
+#else
+    (void)out_debug;
+#endif
 
     ID3D12DescriptorHeap* heaps[] = {heap_};
     cmd_list->SetDescriptorHeaps(1, heaps);
@@ -559,7 +563,11 @@ class SpecMvPass {
   }
 
  private:
+#ifdef CONTROL_RR_DEV
   static constexpr uint32_t kSlots = 7;  // 5 SRV + 2 UAV
+#else
+  static constexpr uint32_t kSlots = 6;  // 5 SRV + spec-MV UAV
+#endif
   static constexpr uint32_t kRingSize = 4;
 
   bool initialized_ = false;
@@ -588,8 +596,6 @@ inline PFN_EvaluateFeature real_evaluate_feature = nullptr;
 inline PFN_AllocateParameters real_allocate_parameters = nullptr;
 inline PFN_ReleaseFeature real_release_feature = nullptr;
 
-// Off means frame generation ignores the hud-less and UI buffers we supply.
-inline std::atomic<bool> ui_recomposition_enabled = true;
 inline std::atomic<bool> ngx_armed = false;
 
 // game's SuperSampling feature + creation stash (all guarded by state_mutex)
@@ -648,9 +654,11 @@ inline SpecMvPass specmv_pass;
 // spec MV output texture (RG16F, render res)
 inline ID3D12Resource* out_specmv = nullptr;
 inline D3D12_RESOURCE_STATES specmv_state = D3D12_RESOURCE_STATE_COMMON;
-// evidence texture (RGBA16F: hit_t, effective_t, |correction|, applied) for the diagnostic dump
+#ifdef CONTROL_RR_DEV
+// Evidence texture (RGBA16F: hit_t, effective_t, |correction|, applied).
 inline ID3D12Resource* out_specdbg = nullptr;
 inline D3D12_RESOURCE_STATES specdbg_state = D3D12_RESOURCE_STATE_COMMON;
+#endif
 
 // live preset selection. Hints are consumed at feature CREATION, so a
 // change releases the affected feature and the next evaluate recreates it
@@ -666,6 +674,8 @@ inline std::atomic<unsigned int> sr_preset = 0;
 inline NVSDK_NGX_Handle* own_sr_handle = nullptr;
 inline NVSDK_NGX_Parameter* own_sr_params = nullptr;
 inline unsigned int own_sr_created_preset = 0;
+inline std::atomic<bool> release_dlssd_requested = false;
+inline std::atomic<bool> release_own_sr_requested = false;
 
 // guide output textures (render res, RGBA16F UAV)
 inline ID3D12Resource* out_nr = nullptr;
@@ -802,6 +812,8 @@ inline bool EnsureResponsivityMask(ID3D12Device* device, ID3D12GraphicsCommandLi
 }
 
 inline bool EnsureGuideTextures(ID3D12Device* device, uint32_t width, uint32_t height) {
+  control_diag::Scope trace("rr.guide_textures");
+  control_diag::Mark("rr.guide_dimensions", width, height);
   ID3D12Resource** outputs[3] = {&out_nr, &out_diffuse, &out_spec};
 
   if (out_nr != nullptr) {
@@ -849,6 +861,7 @@ inline bool EnsureGuideTextures(ID3D12Device* device, uint32_t width, uint32_t h
 
 // spec MV output (RG16F), same self-healing contract as the guides above
 inline bool EnsureSpecMvTexture(ID3D12Device* device, uint32_t width, uint32_t height) {
+  control_diag::Scope trace("rr.specmv_texture");
   if (out_specmv != nullptr) {
     if (specmv_texture_width == width && specmv_texture_height == height) return true;
     out_specmv->Release();
@@ -879,8 +892,47 @@ inline bool EnsureSpecMvTexture(ID3D12Device* device, uint32_t width, uint32_t h
   return true;
 }
 
+inline bool CopyOrdinaryMotion(ID3D12GraphicsCommandList* cmd_list, ID3D12Resource* game_mv) {
+  if (game_mv == nullptr || out_specmv == nullptr) return false;
+  const auto source_desc = game_mv->GetDesc();
+  const auto output_desc = out_specmv->GetDesc();
+  if (source_desc.Dimension != output_desc.Dimension || source_desc.Width != output_desc.Width
+      || source_desc.Height != output_desc.Height || source_desc.Format != output_desc.Format) {
+    static bool warned = false;
+    if (!warned) {
+      LogWarn("ordinary-motion fallback does not match the spec-MV texture");
+      warned = true;
+    }
+    return false;
+  }
+
+  D3D12_RESOURCE_BARRIER open[2] = {};
+  open[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  open[0].Transition.pResource = game_mv;
+  open[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  open[0].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  open[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  open[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  open[1].Transition.pResource = out_specmv;
+  open[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  open[1].Transition.StateBefore = specmv_state;
+  open[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+  cmd_list->ResourceBarrier(2, open);
+  cmd_list->CopyResource(out_specmv, game_mv);
+
+  D3D12_RESOURCE_BARRIER close[2] = {open[0], open[1]};
+  close[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  close[0].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  close[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+  close[1].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  cmd_list->ResourceBarrier(2, close);
+  specmv_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  return true;
+}
+
 // evidence texture for the spec-MV pass (RGBA16F UAV, render res), same
 // self-healing contract: rebuilt whenever the size differs
+#ifdef CONTROL_RR_DEV
 inline uint32_t specdbg_texture_width = 0;
 inline uint32_t specdbg_texture_height = 0;
 inline bool EnsureSpecDbgTexture(ID3D12Device* device, uint32_t width, uint32_t height) {
@@ -911,6 +963,7 @@ inline bool EnsureSpecDbgTexture(ID3D12Device* device, uint32_t width, uint32_t 
   specdbg_texture_height = height;
   return true;
 }
+#endif
 
 // Derive dims/flags from the evaluate-time parameter object if the create
 // hook armed too late to see the game's CreateFeature.
@@ -943,6 +996,7 @@ inline bool DeriveStashFromEvalParams(const NVSDK_NGX_Parameter* params) {
 
 // Log selected NGX scalars and resource descriptions for the first three
 // evaluates. This complements the input-geometry log below.
+#if defined(CONTROL_RR_DEV) || defined(CONTROL_RR_DIAGNOSTICS)
 inline void LogNgxFullParams(const NVSDK_NGX_Parameter* params) {
   auto* p = const_cast<NVSDK_NGX_Parameter*>(params);
   static uint64_t seen = 0;
@@ -1088,6 +1142,7 @@ inline void LogNgxInputGeometry(const NVSDK_NGX_Parameter* params) {
   Log(s.str());
   last_jx = jitter_x;
 }
+#endif
 
 inline bool EnsureDlssd(ID3D12GraphicsCommandList* cmd_list) {
   if (dlssd_handle != nullptr) return true;
@@ -1119,6 +1174,7 @@ inline bool EnsureDlssd(ID3D12GraphicsCommandList* cmd_list) {
   p->Set("DLSS.Use.HW.Depth", 1u);    // depth input is hardware depth
   // default: preset E — by far the most stable preset in this game's RT-heavy scenes
   const unsigned int preset = rr_preset.load();
+  rr_preset_downgraded.store(false);
   dlssd_created_preset = preset;
   p->Set("RayReconstruction.Hint.Render.Preset.DLAA", preset);
   p->Set("RayReconstruction.Hint.Render.Preset.UltraQuality", preset);
@@ -1160,9 +1216,12 @@ inline bool EnsureDlssd(ID3D12GraphicsCommandList* cmd_list) {
     rr_failed = true;
     return false;
   }
+  rr_failed.store(false);
+  rr_last_error.store(0);
   std::stringstream s;
   s << "DLSSD feature created (" << create_w << "x" << create_h
-    << " -> " << out_width << "x" << out_height << ", preset value " << preset << ")";
+    << " -> " << out_width << "x" << out_height << ", preset value "
+    << dlssd_created_preset << ")";
   Log(s.str());
   return true;
 }
@@ -1171,15 +1230,19 @@ inline bool EnsureDlssd(ID3D12GraphicsCommandList* cmd_list) {
 // the game's hint-less one when an SR preset override is selected
 inline bool EnsureOwnSr(ID3D12GraphicsCommandList* cmd_list, unsigned int preset) {
   if (own_sr_handle != nullptr && own_sr_created_preset == preset) return true;
+  if (sr_failed.load()) return false;
   if (real_allocate_parameters == nullptr || real_create_feature == nullptr) return false;
 
-  if (own_sr_handle != nullptr && real_release_feature != nullptr) {
-    real_release_feature(own_sr_handle);
-    own_sr_handle = nullptr;
+  if (own_sr_handle != nullptr) {
+    release_own_sr_requested.store(true);
+    return false;
   }
+  NVSDK_NGX_Result allocate_result = NVSDK_NGX_Result_Success;
   if (own_sr_params == nullptr
-      && real_allocate_parameters(&own_sr_params) != NVSDK_NGX_Result_Success) {
+      && (allocate_result = real_allocate_parameters(&own_sr_params)) != NVSDK_NGX_Result_Success) {
     LogWarn("AllocateParameters (own SR) failed");
+    sr_last_error.store(static_cast<unsigned int>(allocate_result));
+    sr_failed.store(true);
     return false;
   }
 
@@ -1203,13 +1266,99 @@ inline bool EnsureOwnSr(ID3D12GraphicsCommandList* cmd_list, unsigned int preset
     s << "own SR CreateFeature FAILED result=0x" << std::hex << static_cast<unsigned int>(result);
     LogWarn(s.str());
     own_sr_handle = nullptr;
+    sr_last_error.store(static_cast<unsigned int>(result));
+    sr_failed.store(true);
     return false;
   }
   own_sr_created_preset = preset;
+  sr_last_error.store(0);
+  sr_failed.store(false);
   std::stringstream s;
   s << "own SR feature created (preset value " << preset << ")";
   Log(s.str());
   return true;
+}
+
+inline void SetRrEnabled(bool enabled) {
+  control_diag::Scope trace("rr.set_enabled");
+  control_diag::Mark("rr.enabled.request", enabled);
+  const std::lock_guard lock(state_mutex);
+  const bool was_enabled = rr_enabled.exchange(enabled);
+  if (enabled && !was_enabled) {
+    rr_failed.store(false);
+    rr_last_error.store(0);
+    if (own_sr_handle != nullptr) release_own_sr_requested.store(true);
+  } else if (!enabled && was_enabled && dlssd_handle != nullptr) {
+    release_dlssd_requested.store(true);
+  }
+}
+
+inline void SetRrPreset(unsigned int preset) {
+  control_diag::Mark("rr.preset.request", preset);
+  const std::lock_guard lock(state_mutex);
+  if (preset != 6u) rr_preset_downgraded.store(false);
+  if (rr_preset.exchange(preset) == preset) return;
+  rr_failed.store(false);
+  rr_last_error.store(0);
+  if (dlssd_handle != nullptr) release_dlssd_requested.store(true);
+}
+
+inline void SetSrPreset(unsigned int preset) {
+  control_diag::Mark("sr.preset.request", preset);
+  const std::lock_guard lock(state_mutex);
+  if (sr_preset.exchange(preset) == preset) return;
+  sr_failed.store(false);
+  sr_last_error.store(0);
+  if (own_sr_handle != nullptr) release_own_sr_requested.store(true);
+}
+
+// Preset changes and game-SR replacement are applied after the frame's work
+// has been submitted. This keeps one NGX instance at a time and places the
+// only queue wait on an explicit reconfiguration.
+inline void ApplyPendingFeatureChanges(reshade::api::command_queue* queue) {
+  if (queue == nullptr) return;
+  if (!release_dlssd_requested.load() && !release_own_sr_requested.load()) return;
+
+  const std::lock_guard lock(state_mutex);
+  if (!release_dlssd_requested.load() && !release_own_sr_requested.load()) return;
+  control_diag::Scope trace("rr.reconfigure");
+  control_diag::Mark("rr.wait_idle.begin", reinterpret_cast<uint64_t>(queue));
+  queue->wait_idle();
+  control_diag::Mark("rr.wait_idle.end");
+
+  auto release = [&](NVSDK_NGX_Handle*& handle, std::atomic<bool>& requested,
+                     const char* name, bool is_rr) {
+    if (!requested.load()) return;
+    if (handle == nullptr) {
+      requested.store(false);
+      return;
+    }
+    if (real_release_feature == nullptr) return;
+    control_diag::Mark("ngx.release.begin", reinterpret_cast<uint64_t>(handle));
+    const auto result = real_release_feature(handle);
+    control_diag::Mark("ngx.release.end", reinterpret_cast<uint64_t>(handle), static_cast<uint64_t>(result));
+    if (result != NVSDK_NGX_Result_Success) {
+      std::stringstream s;
+      s << name << " release failed result=0x" << std::hex
+        << static_cast<unsigned int>(result);
+      LogWarn(s.str());
+      requested.store(false);
+      if (is_rr) {
+        rr_last_error.store(static_cast<unsigned int>(result));
+        rr_failed.store(true);
+      } else {
+        sr_last_error.store(static_cast<unsigned int>(result));
+        sr_failed.store(true);
+      }
+      return;
+    }
+    handle = nullptr;
+    requested.store(false);
+    Log(std::string(name) + " released for recreate");
+  };
+
+  release(dlssd_handle, release_dlssd_requested, "DLSSD", true);
+  release(own_sr_handle, release_own_sr_requested, "own SR", false);
 }
 
 // ---------------------------------------------------------------------------
@@ -1222,11 +1371,9 @@ inline bool EnsureOwnSr(ID3D12GraphicsCommandList* cmd_list, unsigned int preset
 // impostor buffers. g_mClipToView at +224 is corroborated by our own
 // replacement shader (dlf_spatial_spec.hlsli declares it at
 // packoffset(c14) = byte 224). Capture checks the projection shape, aspect
-// ratio and previous-view transform before publishing matrices. Rejected
-// captures leave the previously accepted matrices in place.
+// ratio and previous-view transform before publishing matrices.
 // ---------------------------------------------------------------------------
 
-inline float mat_world_to_view[16];
 inline float mat_view_to_clip[16];
 inline float mat_clip_to_view[16];
 inline float mat_clip_to_prev_clip[16];
@@ -1297,19 +1444,28 @@ inline bool Invert4(const float* m, float* out) {
 
 inline std::mutex matrix_mutex;
 inline std::atomic<uint64_t> matrix_updates = 0;
+inline uint64_t matrix_last_consumed = 0;
+
+inline void InvalidateCameraMatrices() {
+  const std::lock_guard lock(matrix_mutex);
+  mat_valid = false;
+}
 
 inline void SetCameraMatrices(const float* clip_to_view, const float* prev_view_to_view) {
   float view_to_clip[16];
   float view_to_prev_view[16];
-  if (!Invert4(clip_to_view, view_to_clip)) return;
-  if (!Invert4(prev_view_to_view, view_to_prev_view)) return;
+  if (!Invert4(clip_to_view, view_to_clip) || !Invert4(prev_view_to_view, view_to_prev_view)) {
+    InvalidateCameraMatrices();
+    return;
+  }
 
   float tmp[16];
   float clip_to_prev_clip[16];
   Mul4(clip_to_view, view_to_prev_view, tmp);
   Mul4(tmp, view_to_clip, clip_to_prev_clip);
 
-  // Self-check, logged not gated: the composition is the one part of this
+#ifdef CONTROL_RR_DEV
+  // Developer-only algebra check.
   // with no measured ground truth, so it reports rather than hides.
   //  - inversion residual: max |ClipToView * ViewToClip - I|
   //  - when the camera has not moved, PrevViewToView is identity and the
@@ -1326,17 +1482,19 @@ inline void SetCameraMatrices(const float* clip_to_view, const float* prev_view_
     still_err = std::max(still_err, fabsf(clip_to_prev_clip[i] - ident));
     motion = std::max(motion, fabsf(prev_view_to_view[i] - ident));
   }
+#endif
 
   {
     const std::lock_guard lock(matrix_mutex);
     memcpy(mat_clip_to_view, clip_to_view, 64);
     memcpy(mat_view_to_clip, view_to_clip, 64);
     memcpy(mat_clip_to_prev_clip, clip_to_prev_clip, 64);
-    if (!mat_valid) Log("camera matrices live (clip_to_view + prev_view_to_view, specular dispatch)");
     mat_valid = true;
+    matrix_updates.fetch_add(1);
   }
 
-  const uint64_t n = matrix_updates.fetch_add(1) + 1;
+#ifdef CONTROL_RR_DEV
+  const uint64_t n = matrix_updates.load();
   if (n == 1) {  // once; the periodic census was a render-thread file write
     std::stringstream s;
     s.precision(6);
@@ -1349,15 +1507,24 @@ inline void SetCameraMatrices(const float* clip_to_view, const float* prev_view_
     }
     Log(s.str());
   }
+#endif
 }
 
-// Report whether matrices have arrived from the specular spatial dispatch
-// through SetCameraMatrices.
-inline bool UpdateLatchedMatrices() {
+// A matrix set is valid for the evaluate following its capture only. Reusing
+// an older transform with current depth and hit positions creates plausible
+// but incorrect reflection motion.
+inline bool ConsumeFreshMatrices(SpecMvConstants& constants) {
   const std::lock_guard lock(matrix_mutex);
-  return mat_valid;
+  const uint64_t update = matrix_updates.load();
+  if (!mat_valid || update == matrix_last_consumed) return false;
+  memcpy(constants.clip_to_view, mat_clip_to_view, 64);
+  memcpy(constants.view_to_clip, mat_view_to_clip, 64);
+  memcpy(constants.clip_to_prev_clip, mat_clip_to_prev_clip, 64);
+  matrix_last_consumed = update;
+  return true;
 }
 
+#ifdef CONTROL_RR_DEV
 // ---------------------------------------------------------------------------
 // Diagnostic dump — our decoded guides plus the game's own RR inputs, written to
 // the standard renodx output folder (renodx-dev/dump). Copies are recorded
@@ -1566,6 +1733,7 @@ inline void ServiceDumpOutput(ID3D12GraphicsCommandList* cmd_list) {
   cmd_list->ResourceBarrier(1, &back);
   Log("dump: upscaler output copy recorded after evaluate");
 }
+#endif
 
 // ---------------------------------------------------------------------------
 // hooks
@@ -1574,6 +1742,8 @@ inline void ServiceDumpOutput(ID3D12GraphicsCommandList* cmd_list) {
 inline NVSDK_NGX_Result NVSDK_CONV HookedCreateFeature(
     ID3D12GraphicsCommandList* cmd_list, NVSDK_NGX_Feature feature,
     NVSDK_NGX_Parameter* params, NVSDK_NGX_Handle** out_handle) {
+  control_diag::Scope trace("ngx.create");
+  control_diag::Mark("ngx.create.feature", static_cast<uint64_t>(feature), reinterpret_cast<uint64_t>(cmd_list));
   {
     static std::atomic<int> logged = 0;
     if (logged.fetch_add(1) < 8) {
@@ -1588,12 +1758,18 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedCreateFeature(
   // separately from the back buffer, which is the whole point of supplying
   // them. It has to be set before the feature is created, and this is the
   // only place that sees that moment. 11 = NVSDK_NGX_Feature_FrameGeneration.
-  if (feature == static_cast<NVSDK_NGX_Feature>(11) && params != nullptr
-      && ui_recomposition_enabled.load()) {
+  if (feature == static_cast<NVSDK_NGX_Feature>(11) && params != nullptr) {
     params->Set("DLSSG.UserInterfaceRecompositionEnabled", 1);
   }
 
   const auto result = real_create_feature(cmd_list, feature, params, out_handle);
+  control_diag::Mark("ngx.create.result", static_cast<uint64_t>(result),
+      out_handle != nullptr ? reinterpret_cast<uint64_t>(*out_handle) : 0);
+
+  if (feature == static_cast<NVSDK_NGX_Feature>(11)) {
+    dlssg_probe::active.store(result == NVSDK_NGX_Result_Success
+                              && out_handle != nullptr && *out_handle != nullptr);
+  }
 
   if (feature == NVSDK_NGX_Feature_SuperSampling && result == NVSDK_NGX_Result_Success
       && out_handle != nullptr && *out_handle != nullptr) {
@@ -1618,15 +1794,11 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedCreateFeature(
     // game re-created SR (resolution change) — our features are stale.
     // A failure latched against the OLD feature does not condemn the new one.
     rr_failed = false;
-    if (dlssd_handle != nullptr && real_release_feature != nullptr) {
-      real_release_feature(dlssd_handle);
-      dlssd_handle = nullptr;
-      Log("game recreated SR feature — DLSSD released for recreate");
-    }
-    if (own_sr_handle != nullptr && real_release_feature != nullptr) {
-      real_release_feature(own_sr_handle);
-      own_sr_handle = nullptr;
-    }
+    rr_last_error = 0;
+    sr_failed = false;
+    sr_last_error = 0;
+    if (dlssd_handle != nullptr) release_dlssd_requested.store(true);
+    if (own_sr_handle != nullptr) release_own_sr_requested.store(true);
     // Our textures are NOT released here: EnsureGuideTextures /
     // EnsureSpecMvTexture compare against the resolution they were built at
     // and rebuild themselves. One mechanism, nothing to forget.
@@ -1640,10 +1812,30 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedCreateFeature(
   return result;
 }
 
+inline NVSDK_NGX_Result EvaluateLogged(
+    ID3D12GraphicsCommandList* cmd_list, const NVSDK_NGX_Handle* handle,
+    const NVSDK_NGX_Parameter* params, PFN_NVSDK_NGX_ProgressCallback callback) {
+  control_diag::Mark("ngx.native_evaluate.begin", reinterpret_cast<uint64_t>(handle));
+  const auto result = real_evaluate_feature(cmd_list, handle, params, callback);
+  control_diag::Mark("ngx.native_evaluate.end", reinterpret_cast<uint64_t>(handle), static_cast<uint64_t>(result));
+  if (result != NVSDK_NGX_Result_Success) {
+    static std::atomic<unsigned int> logged_error = 0;
+    if (logged_error.exchange(static_cast<unsigned int>(result)) == static_cast<unsigned int>(result)) return result;
+    std::stringstream message;
+    message << "native evaluate failed handle=" << handle << " result=0x"
+            << std::hex << static_cast<unsigned int>(result);
+    LogWarn(message.str());
+  }
+  return result;
+}
+
 inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeature(
     ID3D12GraphicsCommandList* cmd_list, const NVSDK_NGX_Handle* handle,
     const NVSDK_NGX_Parameter* params, PFN_NVSDK_NGX_ProgressCallback callback) {
+  control_diag::Scope trace("ngx.evaluate");
+  control_diag::Mark("ngx.evaluate.handle", reinterpret_cast<uint64_t>(handle), reinterpret_cast<uint64_t>(cmd_list));
   const std::lock_guard lock(state_mutex);
+  control_diag::Mark("ngx.evaluate.lock_acquired");
 
   // Adopt an SR-shaped evaluate on a handle we do not know: the create hook
   // armed too late, or the game replaced its feature by a path the hook did
@@ -1663,17 +1855,15 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeature(
       Log(s.str());
       game_sr_handle = const_cast<NVSDK_NGX_Handle*>(handle);
       // the replaced feature's size is unknown — rebuild ours from the evaluate
-      if (dlssd_handle != nullptr && real_release_feature != nullptr) {
-        real_release_feature(dlssd_handle);
-        dlssd_handle = nullptr;
-      }
-      if (own_sr_handle != nullptr && real_release_feature != nullptr) {
-        real_release_feature(own_sr_handle);
-        own_sr_handle = nullptr;
-      }
+      if (dlssd_handle != nullptr) release_dlssd_requested.store(true);
+      if (own_sr_handle != nullptr) release_own_sr_requested.store(true);
       create_stash_valid = false;
       rr_failed = false;
+      rr_last_error = 0;
+      sr_failed = false;
+      sr_last_error = 0;
     } else {
+#if defined(CONTROL_RR_DEV) || defined(CONTROL_RR_DIAGNOSTICS)
       static const void* logged_unknown = nullptr;
       if (logged_unknown != handle) {
         logged_unknown = handle;
@@ -1681,60 +1871,69 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeature(
         s << "evaluate on unknown non-SR handle " << static_cast<const void*>(handle);
         Log(s.str());
       }
+#endif
     }
   }
   if (handle == game_sr_handle && handle != nullptr && params != nullptr) {
     if (!create_stash_valid) DeriveStashFromEvalParams(params);
     ReadEvalDims(params);
+#if defined(CONTROL_RR_DEV) || defined(CONTROL_RR_DIAGNOSTICS)
     LogNgxInputGeometry(params);
     LogNgxFullParams(params);
+#endif
   }
 
   const bool is_game_sr = (handle == game_sr_handle && handle != nullptr);
-  if (!is_game_sr || !rr_enabled.load() || rr_failed.load()) {
+  if (!is_game_sr || !rr_enabled.load() || rr_failed.load()
+      || release_dlssd_requested.load() || release_own_sr_requested.load()) {
     if (is_game_sr) {
       if (rr_failed.load()) {
         SetStatus(Status::kFailed, "previous DLSSD failure");
+      } else if (release_dlssd_requested.load() || release_own_sr_requested.load()) {
+        SetStatus(Status::kFallbackSr, "NGX feature waiting for safe reconfiguration");
       } else {
         SetStatus(Status::kFallbackSr, "RR toggled off");
       }
       // SR preset override: evaluate our own hinted SR feature instead
       const unsigned int preset = sr_preset.load();
-      if (preset != 0u && !rr_failed.load()) {
+      if (!rr_enabled.load() && preset != 0u && !sr_failed.load()
+          && !release_dlssd_requested.load() && !release_own_sr_requested.load()) {
         if (!create_stash_valid) DeriveStashFromEvalParams(params);
         if (create_stash_valid && EnsureOwnSr(cmd_list, preset)) {
-          const auto result = real_evaluate_feature(cmd_list, own_sr_handle, params, callback);
+          const auto result = EvaluateLogged(cmd_list, own_sr_handle, params, callback);
           if (result == NVSDK_NGX_Result_Success) return result;
-          LogWarn("own SR evaluate failed — falling back to game SR feature");
+          sr_last_error.store(static_cast<unsigned int>(result));
+          sr_failed.store(true);
+          std::stringstream s;
+          s << "own SR evaluate failed result=0x" << std::hex
+            << static_cast<unsigned int>(result) << " — falling back to game SR feature";
+          LogWarn(s.str());
         }
       }
     }
-    return real_evaluate_feature(cmd_list, handle, params, callback);
+    return EvaluateLogged(cmd_list, handle, params, callback);
   }
 
-  // RR preset changed live — recreate the DLSSD feature with the new hint
-  if (dlssd_handle != nullptr && dlssd_created_preset != rr_preset.load()
-      && real_release_feature != nullptr) {
-    real_release_feature(dlssd_handle);
-    dlssd_handle = nullptr;
-    Log("RR preset changed — DLSSD released for recreate");
+  if (dlssd_handle != nullptr && dlssd_created_preset != rr_preset.load()) {
+    release_dlssd_requested.store(true);
+    return EvaluateLogged(cmd_list, handle, params, callback);
   }
 
   // --- RR path ---
   ID3D12Resource* gbuffer1 = guide_gbuffer1.load();
   if (gbuffer1 == nullptr) {
     SetStatus(Status::kWaitingGuides, "no gbuffer1 captured (guides zeroed or no DLF dispatch yet)");
-    return real_evaluate_feature(cmd_list, handle, params, callback);
+    return EvaluateLogged(cmd_list, handle, params, callback);
   }
 
   if (!create_stash_valid && !DeriveStashFromEvalParams(params)) {
     SetStatus(Status::kWaitingGuides, "no creation stash");
-    return real_evaluate_feature(cmd_list, handle, params, callback);
+    return EvaluateLogged(cmd_list, handle, params, callback);
   }
 
   ID3D12Device* device = nullptr;
   if (FAILED(cmd_list->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr) {
-    return real_evaluate_feature(cmd_list, handle, params, callback);
+    return EvaluateLogged(cmd_list, handle, params, callback);
   }
   device->Release();  // process-lifetime device; no need to hold a ref
 
@@ -1748,7 +1947,7 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeature(
     } else {
       SetStatus(Status::kWaitingGuides, "pass/texture/feature setup incomplete");
     }
-    return real_evaluate_feature(cmd_list, handle, params, callback);
+    return EvaluateLogged(cmd_list, handle, params, callback);
   }
 
   // decode guides on the game's command list, right before evaluate
@@ -1768,6 +1967,7 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeature(
   rrg_pass.Dispatch(cmd_list, gbuffer1, guide_gbuffer2.load(), guide_material.load(),
                     guide_envbrdf.load(), out_nr, out_diffuse, out_spec,
                     eval_width, eval_height);
+  control_diag::Mark("rr.guide_dispatch.complete");
 
   D3D12_RESOURCE_BARRIER barriers[6] = {};
   for (int i = 0; i < 3; ++i) {
@@ -1804,9 +2004,6 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeature(
   // Identity matrices apply no additional transform to the view-space normals
   // supplied by the guide pass.
   static float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
-  static float send_w2v[16];
-  static float send_v2c[16];
-  bool identity_matrices = true;
 
   // This is the GAME's parameter object and it persists across frames, so a
   // key we set once and then stop setting stays set forever. Clear both
@@ -1823,45 +2020,26 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeature(
   p->Set("GBuffer.SpecularMvec", static_cast<ID3D12Resource*>(nullptr));
   p->Set("MotionVectorsReflection", static_cast<ID3D12Resource*>(nullptr));
   p->Set("DLSSD.SpecularHitDistance", static_cast<ID3D12Resource*>(nullptr));
-  ID3D12Resource* hitinfo = guide_hitinfo.load();
   ID3D12Resource* refl_matid = guide_matid.load();
   ID3D12Resource* refl_hitpos = guide_hitpos.load();
-  const int spec_mode = spec_motion_mode.load();
-  const bool matrices_latched = (spec_mode != 0) && UpdateLatchedMatrices();
+  SpecMvConstants constants = {};
+  const bool matrices_fresh = ConsumeFreshMatrices(constants);
+  ID3D12Resource* game_depth = nullptr;
+  ID3D12Resource* game_mv = nullptr;
+  p->Get(NVSDK_NGX_Parameter_Depth, &game_depth);
+  p->Get(NVSDK_NGX_Parameter_MotionVectors, &game_mv);
+  bool specmv_ready = false;
 
-  // Disabled hit-distance path; see kHitTPathEnabled.
-  if (kHitTPathEnabled && spec_mode == 1 && matrices_latched) {
-    // hitT + matrices to NGX (transposed — NGX wants the transpose of the
-    // DirectX row-vector layout, verified in-game)
-    for (int r = 0; r < 4; ++r) {
-      for (int c = 0; c < 4; ++c) {
-        send_w2v[(c * 4) + r] = mat_world_to_view[(r * 4) + c];
-        send_v2c[(c * 4) + r] = mat_view_to_clip[(r * 4) + c];
-      }
-    }
-    p->Set("WorldToViewMatrix", static_cast<void*>(send_w2v));
-    p->Set("ViewToClipMatrix", static_cast<void*>(send_v2c));
-    identity_matrices = false;
-    if (hitinfo != nullptr) {
-      p->Set("DLSSD.SpecularHitDistance", hitinfo);
-      static bool hitt_logged = false;
-      if (!hitt_logged) {
-        Log("mode 1: hitT + real matrices feeding DLSSD");
-        hitt_logged = true;
-      }
-    }
-  } else if (spec_mode == 2 && matrices_latched && refl_matid != nullptr && refl_hitpos != nullptr) {
+  if (matrices_fresh && refl_matid != nullptr && refl_hitpos != nullptr) {
     // app-computed spec MVs from the reflection pass's per-ray hit arrays:
     // our shader consumes the matrices (raw game layout, no
     // NGX transpose trap); NGX receives only a texture
-    ID3D12Resource* game_depth = nullptr;
-    ID3D12Resource* game_mv = nullptr;
-    p->Get(NVSDK_NGX_Parameter_Depth, &game_depth);
-    p->Get(NVSDK_NGX_Parameter_MotionVectors, &game_mv);
-
     if (game_depth != nullptr && game_mv != nullptr && specmv_pass.Init(device)) {
-      if (EnsureSpecMvTexture(device, eval_width, eval_height)
-          && EnsureSpecDbgTexture(device, eval_width, eval_height)) {
+      bool outputs_ready = EnsureSpecMvTexture(device, eval_width, eval_height);
+#ifdef CONTROL_RR_DEV
+      outputs_ready = outputs_ready && EnsureSpecDbgTexture(device, eval_width, eval_height);
+#endif
+      if (outputs_ready) {
         // game MV convention inherited via the correction formulation;
         // scale converts only the ndc-space correction term. MV.Scale maps
         // stored values to pixels; guard degenerate scales.
@@ -1872,10 +2050,6 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeature(
         if (fabsf(scale_x) < 1e-8f) scale_x = 1.0f;
         if (fabsf(scale_y) < 1e-8f) scale_y = 1.0f;
 
-        SpecMvConstants constants = {};
-        memcpy(constants.clip_to_view, mat_clip_to_view, 64);
-        memcpy(constants.view_to_clip, mat_view_to_clip, 64);
-        memcpy(constants.clip_to_prev_clip, mat_clip_to_prev_clip, 64);
         constants.width = eval_width;
         constants.height = eval_height;
         constants.mv_out_scale_x = 0.5f * static_cast<float>(eval_width) / scale_x;
@@ -1894,29 +2068,42 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeature(
           state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         };
         to_uav(out_specmv, specmv_state);
+#ifdef CONTROL_RR_DEV
+        constexpr bool debug_ready = true;
         to_uav(out_specdbg, specdbg_state);
+        ID3D12Resource* debug_output = out_specdbg;
+#else
+        ID3D12Resource* debug_output = nullptr;
+#endif
 
         specmv_pass.Dispatch(cmd_list, gbuffer1, refl_matid, refl_hitpos, game_depth, game_mv,
-                             out_specmv, out_specdbg, constants);
+                             out_specmv, debug_output, constants);
 
         D3D12_RESOURCE_BARRIER after[4] = {};
-        after[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-        after[0].UAV.pResource = out_specmv;
-        after[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-        after[1].UAV.pResource = out_specdbg;
-        for (int i = 2; i < 4; ++i) {
-          after[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-          after[i].Transition.pResource = (i == 2) ? out_specmv : out_specdbg;
-          after[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-          after[i].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-          after[i].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        UINT barrier_count = 0;
+        after[barrier_count].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        after[barrier_count++].UAV.pResource = out_specmv;
+        after[barrier_count].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        after[barrier_count].Transition.pResource = out_specmv;
+        after[barrier_count].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        after[barrier_count].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        after[barrier_count++].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+#ifdef CONTROL_RR_DEV
+        if (debug_ready) {
+          after[barrier_count].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+          after[barrier_count++].UAV.pResource = out_specdbg;
+          after[barrier_count].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+          after[barrier_count].Transition.pResource = out_specdbg;
+          after[barrier_count].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+          after[barrier_count].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+          after[barrier_count++].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+          specdbg_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         }
-        cmd_list->ResourceBarrier(4, after);
+#endif
+        cmd_list->ResourceBarrier(barrier_count, after);
         specmv_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-        specdbg_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
-        p->Set("GBuffer.SpecularMvec", out_specmv);
-        p->Set("MotionVectorsReflection", out_specmv);
+        specmv_ready = true;
         static bool specmv_logged = false;
         if (!specmv_logged) {
           std::stringstream s;
@@ -1929,24 +2116,38 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeature(
     }
   }
 
-  if (identity_matrices) {
-    p->Set("WorldToViewMatrix", static_cast<void*>(identity));
-    p->Set("ViewToClipMatrix", static_cast<void*>(identity));
+  if (!specmv_ready && game_mv != nullptr
+      && EnsureSpecMvTexture(device, eval_width, eval_height)) {
+    control_diag::Mark("specmv.ordinary_fallback", matrices_fresh,
+        (refl_matid != nullptr ? 1u : 0u) | (refl_hitpos != nullptr ? 2u : 0u));
+    specmv_ready = CopyOrdinaryMotion(cmd_list, game_mv);
+  }
+  if (specmv_ready) {
+    p->Set("GBuffer.SpecularMvec", out_specmv);
+    p->Set("MotionVectorsReflection", out_specmv);
   }
 
-  ServiceDump(cmd_list, device, p);
+  p->Set("WorldToViewMatrix", static_cast<void*>(identity));
+  p->Set("ViewToClipMatrix", static_cast<void*>(identity));
 
-  const auto result = real_evaluate_feature(cmd_list, dlssd_handle, params, callback);
+#ifdef CONTROL_RR_DEV
+  ServiceDump(cmd_list, device, p);
+#endif
+
+  const auto result = EvaluateLogged(cmd_list, dlssd_handle, params, callback);
+#ifdef CONTROL_RR_DEV
   ServiceDumpOutput(cmd_list);
+#endif
   if (result != NVSDK_NGX_Result_Success) {
     std::stringstream s;
     s << "DLSSD EvaluateFeature FAILED result=0x" << std::hex << static_cast<unsigned int>(result)
       << " — permanent fallback to game SR";
     LogWarn(s.str());
+    rr_last_error.store(static_cast<unsigned int>(result));
     rr_failed = true;
     SetStatus(Status::kFailed, "DLSSD evaluate failed");
     // rescue this frame with the real SR evaluate so the output is written
-    return real_evaluate_feature(cmd_list, handle, params, callback);
+    return EvaluateLogged(cmd_list, handle, params, callback);
   }
   SetStatus(Status::kActive, "DLSSD evaluating");
   return result;
@@ -1959,6 +2160,8 @@ inline NVSDK_NGX_Result NVSDK_CONV HookedEvaluateFeature(
 inline bool ArmNgxHooks(HMODULE ngx_module) {
   if (ngx_armed.load()) return true;
   if (ngx_module == nullptr) return false;
+  const std::lock_guard install_lock(control_rr::detour_mutex);
+  if (ngx_armed.load()) return true;
 
   auto* create = reinterpret_cast<PFN_CreateFeature>(
       GetProcAddress(ngx_module, "NVSDK_NGX_D3D12_CreateFeature"));
@@ -1972,20 +2175,29 @@ inline bool ArmNgxHooks(HMODULE ngx_module) {
 
   real_create_feature = create;
   real_evaluate_feature = evaluate;
-  real_allocate_parameters = allocate;
-  real_release_feature = release;
-
-  DetourTransactionBegin();
-  DetourUpdateThread(GetCurrentThread());
-  DetourAttach(reinterpret_cast<void**>(&real_create_feature), HookedCreateFeature);
-  DetourAttach(reinterpret_cast<void**>(&real_evaluate_feature), HookedEvaluateFeature);
-  if (DetourTransactionCommit() != NO_ERROR) {
+  LONG error = DetourTransactionBegin();
+  const bool transaction_started = error == NO_ERROR;
+  if (error == NO_ERROR) error = DetourUpdateThread(GetCurrentThread());
+  if (error == NO_ERROR) {
+    error = DetourAttach(reinterpret_cast<void**>(&real_create_feature), HookedCreateFeature);
+  }
+  if (error == NO_ERROR) {
+    error = DetourAttach(reinterpret_cast<void**>(&real_evaluate_feature), HookedEvaluateFeature);
+  }
+  if (error != NO_ERROR) {
+    if (transaction_started) DetourTransactionAbort();
+  } else {
+    error = DetourTransactionCommit();
+  }
+  if (error != NO_ERROR) {
     LogWarn("Detour commit FAILED for NGX exports");
     real_create_feature = create;
     real_evaluate_feature = evaluate;
     return false;
   }
 
+  real_allocate_parameters = allocate;
+  real_release_feature = release;
   ngx_armed = true;
   SetStatus(Status::kArmedNoSr, "NGX exports hooked");
   // Log only the module filename so shared logs do not expose local paths.
@@ -2061,21 +2273,32 @@ inline void InstallLoaderHooks() {
     Log("not the game process — hooks not installed");
     return;
   }
-  real_load_library_w = &LoadLibraryW;
-  real_load_library_ex_w = &LoadLibraryExW;
-  real_load_library_a = &LoadLibraryA;
-  real_load_library_ex_a = &LoadLibraryExA;
-  DetourTransactionBegin();
-  DetourUpdateThread(GetCurrentThread());
-  DetourAttach(reinterpret_cast<void**>(&real_load_library_w), HookedLoadLibraryW);
-  DetourAttach(reinterpret_cast<void**>(&real_load_library_ex_w), HookedLoadLibraryExW);
-  DetourAttach(reinterpret_cast<void**>(&real_load_library_a), HookedLoadLibraryA);
-  DetourAttach(reinterpret_cast<void**>(&real_load_library_ex_a), HookedLoadLibraryExA);
-  if (DetourTransactionCommit() != NO_ERROR) {
-    LogWarn("LoadLibrary detours FAILED — will poll for NGX module instead");
-  } else {
-    loader_hooks_installed = true;
-    Log("LoadLibrary hooks installed (watching for NGX runtime)");
+  {
+    const std::lock_guard install_lock(control_rr::detour_mutex);
+    if (!loader_hooks_installed.load()) {
+      real_load_library_w = &LoadLibraryW;
+      real_load_library_ex_w = &LoadLibraryExW;
+      real_load_library_a = &LoadLibraryA;
+      real_load_library_ex_a = &LoadLibraryExA;
+      LONG error = DetourTransactionBegin();
+      const bool transaction_started = error == NO_ERROR;
+      if (error == NO_ERROR) error = DetourUpdateThread(GetCurrentThread());
+      if (error == NO_ERROR) error = DetourAttach(reinterpret_cast<void**>(&real_load_library_w), HookedLoadLibraryW);
+      if (error == NO_ERROR) error = DetourAttach(reinterpret_cast<void**>(&real_load_library_ex_w), HookedLoadLibraryExW);
+      if (error == NO_ERROR) error = DetourAttach(reinterpret_cast<void**>(&real_load_library_a), HookedLoadLibraryA);
+      if (error == NO_ERROR) error = DetourAttach(reinterpret_cast<void**>(&real_load_library_ex_a), HookedLoadLibraryExA);
+      if (error != NO_ERROR) {
+        if (transaction_started) DetourTransactionAbort();
+      } else {
+        error = DetourTransactionCommit();
+      }
+      if (error != NO_ERROR) {
+        LogWarn("LoadLibrary detours FAILED — will poll for NGX module instead");
+      } else {
+        loader_hooks_installed = true;
+        Log("LoadLibrary hooks installed (watching for NGX runtime)");
+      }
+    }
   }
   // in case the runtime is already resident
   TryArmFromLoadedModules();
@@ -2085,23 +2308,35 @@ inline void InstallLoaderHooks() {
 // unloads points into freed memory (crashed the launcher's shutdown before
 // this existed).
 inline void UninstallHooks() {
-  const bool had_loader = loader_hooks_installed.exchange(false);
-  const bool had_ngx = ngx_armed.exchange(false);
+  const std::lock_guard install_lock(control_rr::detour_mutex);
+  const bool had_loader = loader_hooks_installed.load();
+  const bool had_ngx = ngx_armed.load();
   if (!had_loader && !had_ngx) return;
-
-  DetourTransactionBegin();
-  DetourUpdateThread(GetCurrentThread());
+  LONG error = DetourTransactionBegin();
+  const bool transaction_started = error == NO_ERROR;
+  if (error == NO_ERROR) error = DetourUpdateThread(GetCurrentThread());
   if (had_loader) {
-    DetourDetach(reinterpret_cast<void**>(&real_load_library_w), HookedLoadLibraryW);
-    DetourDetach(reinterpret_cast<void**>(&real_load_library_ex_w), HookedLoadLibraryExW);
-    DetourDetach(reinterpret_cast<void**>(&real_load_library_a), HookedLoadLibraryA);
-    DetourDetach(reinterpret_cast<void**>(&real_load_library_ex_a), HookedLoadLibraryExA);
+    if (error == NO_ERROR) error = DetourDetach(reinterpret_cast<void**>(&real_load_library_w), HookedLoadLibraryW);
+    if (error == NO_ERROR) error = DetourDetach(reinterpret_cast<void**>(&real_load_library_ex_w), HookedLoadLibraryExW);
+    if (error == NO_ERROR) error = DetourDetach(reinterpret_cast<void**>(&real_load_library_a), HookedLoadLibraryA);
+    if (error == NO_ERROR) error = DetourDetach(reinterpret_cast<void**>(&real_load_library_ex_a), HookedLoadLibraryExA);
   }
   if (had_ngx) {
-    DetourDetach(reinterpret_cast<void**>(&real_create_feature), HookedCreateFeature);
-    DetourDetach(reinterpret_cast<void**>(&real_evaluate_feature), HookedEvaluateFeature);
+    if (error == NO_ERROR) error = DetourDetach(reinterpret_cast<void**>(&real_create_feature), HookedCreateFeature);
+    if (error == NO_ERROR) error = DetourDetach(reinterpret_cast<void**>(&real_evaluate_feature), HookedEvaluateFeature);
   }
-  DetourTransactionCommit();
+  if (error != NO_ERROR) {
+    if (transaction_started) DetourTransactionAbort();
+    LogWarn("hook detach transaction failed");
+  } else {
+    error = DetourTransactionCommit();
+    if (error != NO_ERROR) {
+      LogWarn("hook detach commit failed");
+    } else {
+      if (had_loader) loader_hooks_installed.store(false);
+      if (had_ngx) ngx_armed.store(false);
+    }
+  }
 }
 
 }  // namespace rr

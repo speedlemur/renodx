@@ -1,4 +1,7 @@
 /*
+ * Copyright (C) 2026 speedlemur
+ * SPDX-License-Identifier: MIT
+ *
  * control-rr: DLSS Ray Reconstruction for Control, in-process.
  *
  * Control ships DLSS Super Resolution but never Ray Reconstruction. This

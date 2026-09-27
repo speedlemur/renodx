@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026 speedlemur
+ * SPDX-License-Identifier: MIT
+ */
+
 // control-rr: specular motion vectors for DLSS-RR. Per-pixel motion of the
 // REFLECTED image, which is not the motion of the surface it appears on.
 //

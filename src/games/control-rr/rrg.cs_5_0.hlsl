@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026 speedlemur
+ * SPDX-License-Identifier: MIT
+ */
+
 // control-rr: Control G-buffer -> DLSS-RR guide buffers.
 //
 // GBuffer1 (RGBA8): stereographic normal in x/y/w bits, z = gloss.

@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026 speedlemur
+ * SPDX-License-Identifier: MIT
+ */
+
 #pragma once
 
 #include <windows.h>

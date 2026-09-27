@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2023 Carlos Lopez
+ * Copyright (C) 2026 Carlos Lopez, speedlemur
  * SPDX-License-Identifier: MIT
  */
 

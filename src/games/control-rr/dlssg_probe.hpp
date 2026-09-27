@@ -1,4 +1,7 @@
 /*
+ * Copyright (C) 2026 speedlemur
+ * SPDX-License-Identifier: MIT
+ *
  * control-rr: supplies frame generation with the hud-less and UI buffers
  * Control does not provide, by attaching to the host's Streamline instance.
  *

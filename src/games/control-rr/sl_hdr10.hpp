@@ -1,4 +1,7 @@
 /*
+ * Copyright (C) 2026 speedlemur
+ * SPDX-License-Identifier: MIT
+ *
  * control-rr: gives Streamline's frame generation the HDR10 buffers it
  * needs while the game keeps rendering into the FP16 format it asked for.
  *
